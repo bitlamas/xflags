@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- consent screen -->
+    <div id="consent-screen" style="display: none;">
+      <div class="header" style="margin-bottom: 10px;">
+        <h1>xflags</h1>
+      </div>
+
+      <div style="padding: 0 20px 20px 20px;">
+        <p style="line-height: 1.5; margin: 0 0 15px 0;">
+          This extension intercepts X's public API responses to extract country and region data, which is then cached locally in your browser for up to 30 days. No data is transmitted to external servers. All processing happens locally and only publicly available information from X is used.
+        </p>
+
+        <button id="acceptConsentBtn" class="btn-test" style="width: 100%; padding: 10px;">
+          Sure, thanks!
+        </button>
+      </div>
+    </div>
+
+    <!-- main UI -->
+    <div id="main-ui">
+      <div class="header">
+        <h1>xflags</h1>
+      </div>
+
+      <!-- tabs -->
+      <div class="tabs">
+      <button class="tab-button active" data-tab="settings">Settings</button>
+      <button class="tab-button" data-tab="console">Console Info</button>
+    </div>
+
+    <!-- settings tab -->
+    <div class="tab-content" id="settings-tab">
+    <div class="toggle-section">
+      <label class="toggle-label">
+        <span>Enable Extension</span>
+        <div class="toggle-switch" id="toggleSwitch">
+          <div class="toggle-slider"></div>
+        </div>
+      </label>
+    </div>
+
+    <div class="setting-section">
+      <label for="cacheTTL">Cache Duration (days):</label>
+      <input type="number" id="cacheTTL" min="1" max="365" value="30">
+      <button id="saveTTLBtn" class="btn-save">Save</button>
+    </div>
+
+    <button id="clearCacheBtn" class="btn-clear">Clear Cache</button>
+
+    <div class="test-section">
+      <h2>Test Mode</h2>
+      <div id="testStats" class="test-stats">
+        <div>Flags: <strong id="flagCount">0</strong></div>
+        <div>Status: <strong id="testStatus">Not started</strong></div>
+      </div>
+      <button id="startTestBtn" class="btn-test">Start New Test</button>
+      <button id="downloadLogBtn" class="btn-test">Download Log</button>
+    </div>
+
+    </div>
+    <!-- end of settings tab -->
+
+    <!-- console tab -->
+    <div class="tab-content" id="console-tab" style="display: none;">
+      <div class="console-stats">
+        <div class="stat-item">
+          <span class="stat-label">Fetches:</span>
+          <span class="stat-value" id="consoleFetches">0</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">Status:</span>
+          <span class="stat-value" id="consoleStatus">Active</span>
+        </div>
+      </div>
+
+      <div class="console-output" id="consoleOutput">
+        <div class="console-placeholder">Waiting for activity...</div>
+      </div>
+
+      <button id="clearConsoleBtn" class="btn-clear">Clear Console</button>
+    </div>
+    <!-- end of console tab -->
+
+    <div class="footer">
+      <small>v1.0</small>
+    </div>
+    </div>
+    <!-- end main UI -->
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

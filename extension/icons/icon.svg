@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <!-- Simple flag icon placeholder -->
+  <rect width="48" height="48" fill="#1DA1F2"/>
+  <rect x="8" y="12" width="32" height="24" fill="#FFF" rx="2"/>
+  <text x="24" y="30" font-family="Arial" font-size="20" text-anchor="middle" fill="#1DA1F2">🚩</text>
+</svg>

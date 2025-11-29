@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "xflags",
+  "version": "1.0.0",
+  "description": "Shows country flags next to X (Twitter) usernames based on account location",
+  "author": "YOUR_NAME",
+  "homepage_url": "https://github.com/YOUR_USERNAME/xflags",
+
+  "icons": {
+    "48": "icons/icon48.png",
+    "96": "icons/icon96.png",
+    "128": "icons/icon128.png"
+  },
+
+  "permissions": [
+    "storage"
+  ],
+
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": [
+        "utils/browser-compat.js",
+        "utils/country-flags.js",
+        "utils/cache.js",
+        "utils/logger.js",
+        "utils/console-logger.js",
+        "utils/api-data-extractor.js",
+        "content-scripts/flag-renderer.js",
+        "content-scripts/active-fetcher.js",
+        "content-scripts/observer.js",
+        "content-scripts/main.js"
+      ],
+      "css": ["styles/flags.css"],
+      "run_at": "document_start"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content-scripts/interceptor.js",
+        "icons/flags/*.png"
+      ],
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ]
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "xflags",
+    "default_icon": {
+      "48": "icons/icon48.png",
+      "96": "icons/icon96.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "x-country-flags@xflag.dev",
+      "strict_min_version": "109.0"
+    }
+  }
+}
