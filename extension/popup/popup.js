@@ -348,14 +348,28 @@ function initializeMainUI() {
       return;
     }
 
-    let html = '';
+    // Clear existing content
+    consoleOutput.innerHTML = '';
+
+    // Create elements safely using DOM methods
     for (const log of logs) {
       const time = new Date(log.timestamp).toLocaleTimeString();
       const icon = getIconForType(log.type);
-      html += `<div class="console-line ${log.type}">[${time}] ${icon} ${escapeHtml(log.message)}</div>`;
-    }
 
-    consoleOutput.innerHTML = html;
+      const logDiv = document.createElement('div');
+      logDiv.className = 'console-line';
+
+      // Add the log.type as a class only if it's a known safe value
+      const validTypes = ['fetch', 'error', 'status', 'info'];
+      if (validTypes.includes(log.type)) {
+        logDiv.classList.add(log.type);
+      }
+
+      // Use textContent for all dynamic content to prevent XSS
+      logDiv.textContent = `[${time}] ${icon} ${log.message}`;
+
+      consoleOutput.appendChild(logDiv);
+    }
 
     consoleOutput.scrollTop = consoleOutput.scrollHeight;
   }
