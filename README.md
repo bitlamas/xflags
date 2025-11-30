@@ -4,7 +4,7 @@
 
 <br clear="left"/>
 
-This extension uses the country location now publicly available on X to add a country flag in the same style found on 4chan's /int/ and /pol/ boards. [View screenshot](./screenshot.jpg).
+xflags is a Firefox and Chrome extension that uses the country location now publicly available on X to add a country flag in the same style found on 4chan's /int/ and /pol/ boards. [View screenshot](./screenshot.jpg).
 
 It uses X's internal API `AboutAccountQuery` GraphQL endpoint to retrieve user location data, then cache that for 30 days (configurable) to minimize API usage and avoid rate limiting. It uses smart caching to avoid redundant API calls, request queuing to process usernames sequentially and has a 5-minute cooldown after receiving a rate limit 429 error.
 
@@ -12,7 +12,7 @@ No data collection. All local.
 
 ## hic sunt dracones
 
-Even though i'm very conservative making requests at 5s intervals, imposing cooldowns if we get a rate limit error, etc, there's always the chance X doesn't like you using their internal API for this purpose, so let me just remember that you'll be using this at your own risk. I've been developing and testing with my own account and nothing happened so far :-)
+Even though I'm very conservative making requests at 5s intervals, imposing cooldowns if we get a rate limit error, etc, there's always the chance X doesn't like you using their internal API for this purpose, so let me just remember that you'll be using this at your own risk. I've been developing and testing with my own account and nothing happened so far :-)
 
 ## Features
 
