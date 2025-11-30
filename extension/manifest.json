@@ -3,8 +3,8 @@
   "name": "xflags",
   "version": "1.0.0",
   "description": "Shows country flags next to X (Twitter) usernames based on account location",
-  "author": "YOUR_NAME",
-  "homepage_url": "https://github.com/YOUR_USERNAME/xflags",
+  "author": "bitlamas",
+  "homepage_url": "https://github.com/bitlamas/xflags",
 
   "icons": {
     "48": "icons/icon48.png",
