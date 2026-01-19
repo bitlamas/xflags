@@ -1,8 +1,28 @@
 // api interceptor - runs in page context to observe X's responses
+//
+// IMPORTANT: This file runs in PAGE CONTEXT, not extension context.
+// It is injected as a <script> tag and executes within X's JavaScript environment.
+//
+// WHY FUNCTIONS ARE DUPLICATED FROM api-data-extractor.js:
+// - This interceptor runs in PAGE context (window scope of x.com)
+// - api-data-extractor.js runs in EXTENSION context (content script)
+// - Page context CANNOT import modules or access extension APIs
+// - Extension context CANNOT intercept page's XHR/fetch calls
+// - Therefore, we must duplicate: getNestedValue, extractCountryData, extractScreenName, isRelevantAPICall
+//
+// The duplication is intentional and necessary for the architecture to work.
 
 (function() {
+  // Headers stored in closure - not exposed globally or via postMessage unnecessarily
+  // This minimizes the exposure of sensitive auth tokens
   let capturedHeaders = null;
+  let headersSentToExtension = false;
 
+  /**
+   * Capture auth headers from X's API requests
+   * Headers are stored in closure and only sent to extension context once
+   * @param {Object|Headers} headers - Request headers
+   */
   function captureHeaders(headers) {
     if (!headers) {
       return;
@@ -16,7 +36,7 @@
       return headers[key];
     };
 
-    capturedHeaders = {
+    const newHeaders = {
       'authorization': getHeader('authorization'),
       'x-csrf-token': getHeader('x-csrf-token'),
       'x-twitter-auth-type': getHeader('x-twitter-auth-type'),
@@ -24,18 +44,34 @@
       'x-twitter-client-language': getHeader('x-twitter-client-language')
     };
 
-    Object.keys(capturedHeaders).forEach(key => {
-      if (!capturedHeaders[key]) delete capturedHeaders[key];
+    // Remove undefined/null values
+    Object.keys(newHeaders).forEach(key => {
+      if (!newHeaders[key]) delete newHeaders[key];
     });
 
-    if (Object.keys(capturedHeaders).length > 0) {
-      window.postMessage({
-        type: 'XFLAG_HEADERS_CAPTURED',
-        headers: capturedHeaders
-      }, '*');
+    // Only update and send if we have valid headers
+    if (Object.keys(newHeaders).length > 0 && newHeaders.authorization) {
+      capturedHeaders = newHeaders;
+
+      // Send headers to extension context only once (or when they change)
+      // This minimizes exposure of sensitive data via postMessage
+      if (!headersSentToExtension) {
+        headersSentToExtension = true;
+        // Security: Use specific origin instead of '*' to prevent cross-origin message interception
+        window.postMessage({
+          type: 'XFLAG_HEADERS_CAPTURED',
+          headers: capturedHeaders
+        }, window.location.origin);
+      }
     }
   }
 
+  /**
+   * Safely get nested value from object using dot notation path
+   * @param {Object} obj - Source object
+   * @param {string} path - Dot-separated path (e.g., 'data.user.name')
+   * @returns {*} Value at path or undefined
+   */
   function getNestedValue(obj, path) {
     const keys = path.split('.');
     let current = obj;
@@ -49,23 +85,37 @@
     return current;
   }
 
-  // extract country data from api response (recursive search for all users)
+  /**
+   * Extract country data from API response (recursive search for all users)
+   * Uses WeakSet to prevent infinite loops from circular references
+   * Uses Object.keys() instead of for...in to avoid inherited properties
+   * @param {Object} apiResponse - Parsed JSON response from X API
+   * @returns {Array<{screenName: string, location: string, accurate: boolean}>}
+   */
   function extractCountryData(apiResponse) {
-    let maxDepthReached = 0;
-    let objectsExamined = 0;
-    let screenNameFoundCount = 0;
-    let locationFoundCount = 0;
+    // WeakSet to track visited objects and prevent circular reference issues
+    const visited = new WeakSet();
 
+    /**
+     * Recursively find user location data in nested objects
+     * @param {*} obj - Current object to examine
+     * @param {number} depth - Current recursion depth
+     * @returns {Array} Array of user location objects
+     */
     function findUserLocations(obj, depth = 0) {
-      if (depth > maxDepthReached) maxDepthReached = depth;
-      if (depth > 25) return []; // prevent excessive recursion
+      // Prevent excessive recursion
+      if (depth > 25) return [];
 
+      // Skip non-objects and primitives
       if (!obj || typeof obj !== 'object') return [];
 
-      objectsExamined++;
-      let foundUsers = [];
+      // Prevent circular reference infinite loops
+      if (visited.has(obj)) return [];
+      visited.add(obj);
 
-      // pattern 1: screen_name and location at same level (rare)
+      const foundUsers = [];
+
+      // Pattern 1: screen_name and location at same level (rare)
       if (obj.screen_name && typeof obj.screen_name === 'string') {
         let location = null;
         let accurate = true;
@@ -88,7 +138,7 @@
         }
       }
 
-      // pattern 2: obj.legacy.screen_name with obj.location as sibling (X's actual structure!)
+      // Pattern 2: obj.legacy.screen_name with obj.location as sibling (X's actual structure!)
       if (obj.legacy && obj.legacy.screen_name && typeof obj.legacy.screen_name === 'string') {
         let location = null;
         let accurate = true;
@@ -111,23 +161,32 @@
         }
       }
 
-      for (const key in obj) {
-        if (Array.isArray(obj[key])) {
-          obj[key].forEach(item => {
+      // Recursively search child properties
+      // Use Object.keys() instead of for...in to avoid inherited properties
+      const keys = Object.keys(obj);
+      for (const key of keys) {
+        const value = obj[key];
+        if (Array.isArray(value)) {
+          for (const item of value) {
             foundUsers.push(...findUserLocations(item, depth + 1));
-          });
-        } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-          foundUsers.push(...findUserLocations(obj[key], depth + 1));
+          }
+        } else if (typeof value === 'object' && value !== null) {
+          foundUsers.push(...findUserLocations(value, depth + 1));
         }
       }
 
       return foundUsers;
     }
 
-    const allUsers = findUserLocations(apiResponse);
-    return allUsers;
+    return findUserLocations(apiResponse);
   }
 
+  /**
+   * Extract screen name from URL or API response
+   * @param {string} url - Request URL
+   * @param {Object} apiResponse - Parsed JSON response
+   * @returns {string|null} Screen name or null
+   */
   function extractScreenName(url, apiResponse) {
     const urlMatch = url.match(/screenName[=:]"?([^"&]+)"?/);
     if (urlMatch) return urlMatch[1];
@@ -140,7 +199,9 @@
         if (parsed.screenName) return parsed.screenName;
         if (parsed.screen_name) return parsed.screen_name;
       }
-    } catch (e) {}
+    } catch (e) {
+      // URL parsing failed, continue to fallback
+    }
 
     const paths = [
       'data.user_result_by_screen_name.result.legacy.screen_name',
@@ -159,6 +220,11 @@
     return null;
   }
 
+  /**
+   * Check if URL is a relevant API endpoint for location data
+   * @param {string} url - Request URL
+   * @returns {boolean} True if relevant
+   */
   function isRelevantAPICall(url) {
     const relevantEndpoints = [
       'UserByScreenName',
@@ -179,7 +245,6 @@
 
     // capture headers from X's graphql api calls (though X uses XHR, not fetch)
     if (url && url.includes('x.com/i/api/graphql')) {
-
       // handle both fetch(url, options) and fetch(Request)
       let headers = null;
       if (typeof args[0] === 'string' && args[1]) {
@@ -205,13 +270,14 @@
           const screenName = extractScreenName(url, data);
 
           if (screenName) {
+            // Security: Use specific origin instead of '*'
             window.postMessage({
               type: 'XFLAG_COUNTRY_DATA',
               screenName: screenName,
               location: countryData.location,
               accurate: countryData.accurate,
               source: countryData.source
-            }, '*');
+            }, window.location.origin);
           }
         }
       } catch (e) {
@@ -277,15 +343,16 @@
           const usersWithLocation = extractCountryData(data);
 
           usersWithLocation.forEach(({screenName, location, accurate}) => {
+            // Security: Use specific origin instead of '*'
             window.postMessage({
               type: 'XFLAG_COUNTRY_DATA',
               screenName,
               location,
               accurate
-            }, '*');
+            }, window.location.origin);
           });
         } catch (e) {
-          console.error('[xflags] ❌ Error in XHR load handler:', e);
+          console.error('[xflags] Error in XHR load handler:', e);
         }
       });
     }

@@ -184,31 +184,8 @@ class FlagRenderer {
     return null;
   }
 
-  findHandleLink(container, screenName) {
-    const links = container.querySelectorAll('a[href^="/"]');
-
-    for (const link of links) {
-      const text = link.textContent?.trim();
-      const href = link.getAttribute('href');
-
-      // check for both regular @ (U+0040) and fullwidth @ (U+FF20)
-      if ((text === `@${screenName}` || text === `＠${screenName}` || text === screenName) &&
-          (href === `/${screenName}` || href.startsWith(`/${screenName}?`))) {
-        return link;
-      }
-    }
-
-    // fallback: find any link to the user's profile that looks like a handle
-    for (const link of links) {
-      const href = link.getAttribute('href');
-      if ((href === `/${screenName}` || href.startsWith(`/${screenName}?`)) &&
-          (link.textContent?.includes('@') || link.textContent?.includes('＠'))) {
-        return link;
-      }
-    }
-
-    return null;
-  }
+  // NOTE: findHandleLink function was removed as it was unused.
+  // If needed in the future, it can be restored from version control.
 
   createFlagElement(flagURL, countryData) {
     const container = document.createElement('span');

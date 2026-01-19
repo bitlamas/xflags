@@ -4,66 +4,140 @@
 
 <br clear="left"/>
 
-xflags is a Firefox and Chrome extension that uses the country location now publicly available on X to add a country flag in the same style found on 4chan's /int/ and /pol/ boards. [View screenshot](./screenshot.jpg).
-
-It uses X's internal API `AboutAccountQuery` GraphQL endpoint to retrieve user location data, then cache that for 30 days (configurable) to minimize API usage and avoid rate limiting. It uses smart caching to avoid redundant API calls, request queuing to process usernames sequentially and has a 5-minute cooldown after receiving a rate limit 429 error.
+A Firefox and Chrome extension that displays country flags next to X (Twitter) usernames, using the same 4chan /int/ and /pol/ style flags. [View screenshot](./screenshot.jpg).
 
 No data collection. All local.
 
-## hic sunt dracones
-
-Even though I'm very conservative making requests at 5s intervals, imposing cooldowns if we get a rate limit error, etc, there's always the chance X doesn't like you using their internal API for this purpose, so let me just remember that you'll be using this at your own risk. I've been developing and testing with my own account and nothing happened so far :-)
-
 ## Features
 
-- 4chan's PNG country flags next to usernames
-- Display VPN indicator for accounts with inaccurate location data
-- Has as built-in console tab to track fetches, rate limiting status, etc
+- 4chan PNG country flags next to usernames
+- VPN indicator for accounts with inaccurate location data
+- Built-in console tab to track fetches and rate limiting status
+- Configurable cache TTL (1-365 days, default 30 days)
+- Cross-tab request deduplication
+- Viewport-priority fetching (visible users fetched first)
+- Opt-in error logging with local export
 
-### Regional flags
+### Regional Flags
 
-X's API sometimes does not return a country but a region, like "North America" or "East Asia & Pacific". These are treated differently, e.g. Europe is shown as EU flag, while West Asia may show just a standard globe icon.
+X's API sometimes returns a region instead of a country (e.g., "North America", "East Asia & Pacific"). These display as regional icons—Europe shows the EU flag, while broader regions show a globe icon.
 
 ## Installation
 
 ### Firefox
 
-1. download or clone this repository:
+1. Clone this repository:
    ```bash
    git clone https://github.com/bitlamas/xflags.git
-   cd xflags
    ```
 
-2. open Firefox and navigate to `about:debugging#/runtime/this-firefox`
+2. Navigate to `about:debugging#/runtime/this-firefox`
 
-3. click "Load Temporary Add-on"
-
-4. navigate to the `extension` folder and select `manifest.json`
+3. Click "Load Temporary Add-on" and select `extension/manifest.json`
 
 ### Chrome/Chromium
 
-1. download or clone this repository:
+1. Clone this repository:
    ```bash
    git clone https://github.com/bitlamas/xflags.git
-   cd xflags
    ```
 
-2. open Chrome and navigate to `chrome://extensions/`
+2. Navigate to `chrome://extensions/`
 
-3. enable "Developer mode" in the top right
+3. Enable "Developer mode" (top right)
 
-4. click "Load unpacked"
+4. Click "Load unpacked" and select the `extension` folder
 
-5. select the `extension` folder
+## How It Works
 
-## Known issues
-- Sometimes an account may get stuck with the loading icon, but if you keep scrolling it will eventually fetch it
-- If you're a power user you'll hit the fetch limit, guaranteed: you need to be patient as X imposes rate limits, so if you're a power user you'll often hit the limit. Soon enough, though, you will have a sizeable local cache for many repeating accounts and it will minimize the API calls.
+xflags intercepts X's GraphQL API responses to extract user location data, then renders country flags in the DOM.
 
-## About
+### Architecture
 
-- Manifest V3
-- Vanilla JavaScript
-- Browser's local storage API for caching
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Service Worker                           │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
+│  │ UnifiedCache│  │ Deduplicator │  │ RateLimitCoordinator  │  │
+│  └─────────────┘  └──────────────┘  └───────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ chrome.runtime.sendMessage
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Content Scripts                            │
+│  ┌────────────┐  ┌──────────┐  ┌─────────────┐  ┌───────────┐  │
+│  │ interceptor│  │ observer │  │ active-fetch│  │ renderer  │  │
+│  │ (page ctx) │  │ (DOM)    │  │ (API queue) │  │ (flags)   │  │
+│  └────────────┘  └──────────┘  └─────────────┘  └───────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-This software is GPLv3+; included 4chan PNG flags are not licensed under the GPL.
+### Data Flow
+
+1. **Interception** — `interceptor.js` runs in page context, monkey-patches `fetch`/`XMLHttpRequest` to capture auth headers and extract location data from `AboutAccountQuery` responses
+
+2. **Observation** — `observer.js` uses MutationObserver to detect new tweets in the DOM
+
+3. **Cache Check** — For each username, the service worker's unified cache is queried
+
+4. **Fetching** — On cache miss, `active-fetcher.js` queues the request with viewport-based priority (visible users first)
+
+5. **Rendering** — `flag-renderer.js` inserts the flag element next to the username
+
+### Cross-Context Communication
+
+The extension operates across three contexts:
+
+| Context | Scripts | Communication |
+|---------|---------|---------------|
+| **Page** | `interceptor.js` | `postMessage` to content script |
+| **Content** | `main.js`, `observer.js`, etc. | `chrome.runtime.sendMessage` to service worker |
+| **Background** | `service-worker.js` | Handles messages from all tabs |
+
+The interceptor must run in page context to access X's fetch responses, but cannot directly communicate with the service worker—hence the postMessage bridge through content scripts.
+
+### Rate Limiting
+
+- 5-second minimum interval between API requests
+- 5-minute cooldown after receiving HTTP 429
+- Coordinated across all tabs via service worker
+- Viewport-priority queue ensures visible users are fetched first
+
+## Project Structure
+
+```
+extension/
+├── manifest.json
+├── background/
+│   └── service-worker.js    # Central coordinator
+├── content-scripts/
+│   ├── main.js              # Entry point, message routing
+│   ├── interceptor.js       # Page-context XHR/fetch interception
+│   ├── observer.js          # MutationObserver for new tweets
+│   ├── active-fetcher.js    # Priority queue, rate-limited requests
+│   └── flag-renderer.js     # DOM manipulation
+├── utils/
+│   ├── cache.js             # Service worker cache client
+│   ├── constants.js         # Message types, timing values
+│   ├── country-flags.js     # Country name → flag filename map
+│   └── browser-compat.js    # Firefox/Chrome API abstraction
+├── popup/
+│   ├── popup.html/css/js    # Settings UI
+└── icons/flags/             # 4chan PNG flags
+```
+
+## Known Issues
+
+- Accounts may occasionally get stuck with a loading icon—scrolling usually resolves this
+- Power users will hit rate limits frequently; the local cache grows over time and reduces API calls
+
+## Disclaimer
+
+This extension uses X's internal `AboutAccountQuery` GraphQL endpoint. While the extension is conservative with request frequency, use at your own risk—X may not appreciate unofficial API usage.
+
+## License
+
+GPLv3+
+
+The included 4chan PNG flags are not licensed under the GPL.

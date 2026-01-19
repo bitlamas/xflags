@@ -191,6 +191,24 @@ h1 {
   background: #d9e0e3;
 }
 
+.error-logging-section {
+  margin-top: 16px;
+  padding: 12px;
+  background: #f7f9f9;
+  border-radius: 8px;
+}
+
+.error-logging-section .toggle-label {
+  margin-bottom: 8px;
+}
+
+.setting-description {
+  font-size: 11px;
+  color: #536471;
+  margin: 8px 0 0 0;
+  line-height: 1.4;
+}
+
 .test-section {
   margin-top: 16px;
   padding: 12px;
@@ -364,6 +382,14 @@ h1 {
   }
 
   .footer small {
+    color: #8b98a5;
+  }
+
+  .error-logging-section {
+    background: #192734;
+  }
+
+  .setting-description {
     color: #8b98a5;
   }
 }

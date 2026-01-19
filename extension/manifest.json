@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "xflags",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shows country flags next to X (Twitter) usernames based on account location",
   "author": "bitlamas",
   "homepage_url": "https://github.com/bitlamas/xflags",
@@ -15,6 +15,10 @@
   "permissions": [
     "storage"
   ],
+
+  "background": {
+    "scripts": ["background/service-worker.js"]
+  },
 
   "host_permissions": [
     "https://x.com/*",

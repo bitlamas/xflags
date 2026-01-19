@@ -9,18 +9,34 @@
  * - Fetcher state tracking (active/idle/rate-limited)
  * - Formatted output for popup UI
  * - Statistics aggregation
+ * - Debounced console output to prevent flooding in high-activity scenarios
  *
  * @class
  */
 class ConsoleLogger {
   constructor() {
+    /** @type {Array<{timestamp: number, type: string, message: string}>} */
     this.logs = [];
-    this.maxLogs = 100; // keep last 100 log entries
+
+    /** @type {number} Maximum number of log entries to keep */
+    this.maxLogs = 100;
+
+    /** @type {string} Current fetcher state */
     this.currentFetcherState = 'active'; // 'active' | 'idle' | 'rate-limited'
+
+    /** @type {Array<{type: string, message: string}>} Pending logs to write to console */
+    this.pendingConsoleLogs = [];
+
+    /** @type {number|null} Debounce timer for console output */
+    this.consoleDebounceTimer = null;
+
+    /** @type {number} Debounce delay in milliseconds */
+    this.consoleDebounceDelay = 100;
   }
 
   /**
    * Add a log entry
+   * Logs are immediately added to the internal buffer but console output is debounced
    * @param {string} type - Type of log: 'fetch', 'error', 'status', 'info'
    * @param {string} message - Log message
    */
@@ -37,21 +53,78 @@ class ConsoleLogger {
       this.logs.shift();
     }
 
-    const prefix = '[xflags]';
-    switch (type) {
-      case 'fetch':
-        console.log(`${prefix} ✓ ${message}`);
-        break;
-      case 'error':
-        console.error(`${prefix} ✗ ${message}`);
-        break;
-      case 'status':
-        console.warn(`${prefix} ${message}`);
-        break;
-      case 'info':
-      default:
-        console.log(`${prefix} ${message}`);
+    // Queue console output and debounce
+    this.pendingConsoleLogs.push({ type, message });
+    this.scheduleConsoleFlush();
+  }
+
+  /**
+   * Schedule a debounced flush of pending console logs
+   * This prevents console flooding in high-activity scenarios
+   * @private
+   */
+  scheduleConsoleFlush() {
+    if (this.consoleDebounceTimer !== null) {
+      clearTimeout(this.consoleDebounceTimer);
     }
+
+    this.consoleDebounceTimer = setTimeout(() => {
+      this.flushConsoleLogs();
+      this.consoleDebounceTimer = null;
+    }, this.consoleDebounceDelay);
+  }
+
+  /**
+   * Flush all pending logs to the console
+   * Groups similar log types together for cleaner output
+   * @private
+   */
+  flushConsoleLogs() {
+    if (this.pendingConsoleLogs.length === 0) return;
+
+    const prefix = '[xflags]';
+
+    // If there are many pending logs, summarize them
+    if (this.pendingConsoleLogs.length > 10) {
+      const counts = { fetch: 0, error: 0, status: 0, info: 0 };
+      for (const log of this.pendingConsoleLogs) {
+        counts[log.type] = (counts[log.type] || 0) + 1;
+      }
+
+      const summary = Object.entries(counts)
+        .filter(([, count]) => count > 0)
+        .map(([type, count]) => `${type}: ${count}`)
+        .join(', ');
+
+      console.log(`${prefix} Batch: ${summary}`);
+
+      // Still log errors individually as they're important
+      for (const log of this.pendingConsoleLogs) {
+        if (log.type === 'error') {
+          console.error(`${prefix} [X] ${log.message}`);
+        }
+      }
+    } else {
+      // Log each entry individually
+      for (const log of this.pendingConsoleLogs) {
+        switch (log.type) {
+          case 'fetch':
+            console.log(`${prefix} [OK] ${log.message}`);
+            break;
+          case 'error':
+            console.error(`${prefix} [X] ${log.message}`);
+            break;
+          case 'status':
+            console.warn(`${prefix} ${log.message}`);
+            break;
+          case 'info':
+          default:
+            console.log(`${prefix} ${log.message}`);
+        }
+      }
+    }
+
+    this.pendingConsoleLogs = [];
   }
 
   /**
@@ -64,7 +137,7 @@ class ConsoleLogger {
 
   /**
    * Get all logs
-   * @returns {Array} Array of log entries
+   * @returns {Array<{timestamp: number, type: string, message: string}>} Array of log entries
    */
   getLogs() {
     return this.logs;
@@ -73,7 +146,7 @@ class ConsoleLogger {
   /**
    * Get logs since a timestamp
    * @param {number} since - Timestamp
-   * @returns {Array} Array of log entries after timestamp
+   * @returns {Array<{timestamp: number, type: string, message: string}>} Array of log entries after timestamp
    */
   getLogsSince(since) {
     return this.logs.filter(log => log.timestamp > since);
@@ -102,11 +175,11 @@ class ConsoleLogger {
    */
   getIconForType(type) {
     switch (type) {
-      case 'fetch': return '✓';
-      case 'error': return '✗';
-      case 'status': return '⚠';
-      case 'info': return 'ℹ';
-      default: return '·';
+      case 'fetch': return '[OK]';
+      case 'error': return '[X]';
+      case 'status': return '[!]';
+      case 'info': return '[i]';
+      default: return '[-]';
     }
   }
 
@@ -115,11 +188,16 @@ class ConsoleLogger {
    */
   clear() {
     this.logs = [];
+    this.pendingConsoleLogs = [];
+    if (this.consoleDebounceTimer !== null) {
+      clearTimeout(this.consoleDebounceTimer);
+      this.consoleDebounceTimer = null;
+    }
   }
 
   /**
    * Get summary stats
-   * @returns {Object} Stats object
+   * @returns {{total: number, fetches: number, errors: number, rateLimited: boolean, idle: boolean}} Stats object
    */
   getStats() {
     const totalFetches = this.logs.filter(log => log.type === 'fetch').length;

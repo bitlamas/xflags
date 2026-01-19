@@ -1,10 +1,33 @@
+// popup.js - Extension popup UI controller
+//
+// NOTE: This file runs in the popup context, which is separate from content scripts.
+// The browser API detection here is duplicated from browser-compat.js because:
+// - Popup context cannot share window.xflagBrowser from content scripts
+// - The popup HTML only loads popup.js, not the full content script bundle
+// - This is an intentional architectural decision for isolation
+
 const ENABLED_KEY = 'xflag_enabled';
 const CACHE_TTL_KEY = 'xflag_cache_ttl';
 const CONSENT_KEY = 'xflag_consent_given';
+const ERROR_LOG_ENABLED_KEY = 'xflag_error_log_enabled';
 const DEFAULT_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+const REFRESH_INTERVAL = 2000; // 2 seconds
+
+/**
+ * Service Worker Message Types for error logging
+ */
+const SW_MESSAGE_TYPES = {
+  ERROR_LOG: 'SW_ERROR_LOG',
+  ERROR_GET_ALL: 'SW_ERROR_GET_ALL',
+  ERROR_CLEAR: 'SW_ERROR_CLEAR',
+  ERROR_EXPORT: 'SW_ERROR_EXPORT'
+};
 
 const isFirefox = typeof browser !== 'undefined';
 const browserAPI = isFirefox ? browser : chrome;
+
+// Store interval reference for cleanup
+let refreshIntervalId = null;
 
 // check consent on load
 (async function() {
@@ -95,6 +118,10 @@ function initializeMainUI() {
   const flagCount = document.getElementById('flagCount');
   const testStatus = document.getElementById('testStatus');
 
+  // Error logging elements
+  const errorLoggingSwitch = document.getElementById('errorLoggingSwitch');
+  const downloadErrorLogBtn = document.getElementById('downloadErrorLogBtn');
+
   const tabButtons = document.querySelectorAll('.tab-button');
   const settingsTab = document.getElementById('settings-tab');
   const consoleTab = document.getElementById('console-tab');
@@ -107,8 +134,8 @@ function initializeMainUI() {
   async function loadState() {
     try {
       const result = isFirefox ?
-        await browser.storage.local.get([ENABLED_KEY, CACHE_TTL_KEY]) :
-        await new Promise(resolve => chrome.storage.local.get([ENABLED_KEY, CACHE_TTL_KEY], resolve));
+        await browser.storage.local.get([ENABLED_KEY, CACHE_TTL_KEY, ERROR_LOG_ENABLED_KEY]) :
+        await new Promise(resolve => chrome.storage.local.get([ENABLED_KEY, CACHE_TTL_KEY, ERROR_LOG_ENABLED_KEY], resolve));
 
       const isEnabled = result[ENABLED_KEY] !== undefined ? result[ENABLED_KEY] : true;
       updateToggle(isEnabled);
@@ -116,10 +143,15 @@ function initializeMainUI() {
       const ttl = result[CACHE_TTL_KEY] || DEFAULT_CACHE_TTL;
       const days = Math.round(ttl / (24 * 60 * 60 * 1000));
       cacheTTLInput.value = days;
+
+      // Load error logging state
+      const errorLoggingEnabled = result[ERROR_LOG_ENABLED_KEY] === true;
+      updateErrorLoggingToggle(errorLoggingEnabled);
     } catch (error) {
       console.error('Error loading state:', error);
       updateToggle(true);
       cacheTTLInput.value = 30;
+      updateErrorLoggingToggle(false);
     }
   }
 
@@ -128,6 +160,14 @@ function initializeMainUI() {
       toggleSwitch.classList.add('enabled');
     } else {
       toggleSwitch.classList.remove('enabled');
+    }
+  }
+
+  function updateErrorLoggingToggle(isEnabled) {
+    if (isEnabled) {
+      errorLoggingSwitch.classList.add('enabled');
+    } else {
+      errorLoggingSwitch.classList.remove('enabled');
     }
   }
 
@@ -220,6 +260,99 @@ function initializeMainUI() {
     } catch (error) {
       console.error('Error saving TTL:', error);
       alert('Error saving cache duration.');
+    }
+  });
+
+  // Error logging toggle handler
+  errorLoggingSwitch.addEventListener('click', async () => {
+    try {
+      const result = isFirefox ?
+        await browser.storage.local.get(ERROR_LOG_ENABLED_KEY) :
+        await new Promise(resolve => chrome.storage.local.get(ERROR_LOG_ENABLED_KEY, resolve));
+
+      const currentState = result[ERROR_LOG_ENABLED_KEY] === true;
+      const newState = !currentState;
+
+      // Save to local storage
+      if (isFirefox) {
+        await browser.storage.local.set({ [ERROR_LOG_ENABLED_KEY]: newState });
+      } else {
+        await new Promise(resolve => chrome.storage.local.set({ [ERROR_LOG_ENABLED_KEY]: newState }, resolve));
+      }
+
+      // Notify service worker
+      try {
+        await browserAPI.runtime.sendMessage({
+          type: SW_MESSAGE_TYPES.ERROR_LOG,
+          enabled: newState
+        });
+      } catch (e) {
+        // Service worker might not be available
+        console.warn('Could not notify service worker of error logging change:', e);
+      }
+
+      updateErrorLoggingToggle(newState);
+      console.log(`[xflags] Error logging ${newState ? 'enabled' : 'disabled'}`);
+    } catch (error) {
+      console.error('Error toggling error logging:', error);
+    }
+  });
+
+  // Download error log handler
+  downloadErrorLogBtn.addEventListener('click', async () => {
+    try {
+      // Request error export from service worker
+      const response = await browserAPI.runtime.sendMessage({
+        type: SW_MESSAGE_TYPES.ERROR_EXPORT
+      });
+
+      if (response && response.success && response.data) {
+        const exportData = response.data;
+
+        // Format as pretty JSON
+        const jsonContent = JSON.stringify(exportData, null, 2);
+
+        // Create download
+        const blob = new Blob([jsonContent], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `xflags-error-log-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        console.log(`[xflags] Downloaded error log with ${exportData.errorCount} errors`);
+      } else {
+        // No service worker response, try to get from local storage
+        const result = isFirefox ?
+          await browser.storage.local.get('xflag_error_log') :
+          await new Promise(resolve => chrome.storage.local.get('xflag_error_log', resolve));
+
+        const errors = result['xflag_error_log'] || [];
+
+        const exportData = {
+          exportedAt: new Date().toISOString(),
+          extensionVersion: browserAPI.runtime.getManifest?.()?.version || 'unknown',
+          browserInfo: {
+            userAgent: 'redacted',
+            platform: navigator.platform || 'unknown'
+          },
+          errorCount: errors.length,
+          errors: errors
+        };
+
+        const jsonContent = JSON.stringify(exportData, null, 2);
+        const blob = new Blob([jsonContent], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `xflags-error-log-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    } catch (error) {
+      console.error('Error downloading error log:', error);
+      alert('Error downloading error log. The log may be empty.');
     }
   });
 
@@ -376,19 +509,16 @@ function initializeMainUI() {
 
   function getIconForType(type) {
     switch (type) {
-      case 'fetch': return '✓';
-      case 'error': return '✗';
-      case 'status': return '⚠';
-      case 'info': return 'ℹ';
-      default: return '·';
+      case 'fetch': return '[OK]';
+      case 'error': return '[X]';
+      case 'status': return '[!]';
+      case 'info': return '[i]';
+      default: return '[-]';
     }
   }
 
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
+  // NOTE: escapeHtml function was removed as it was unused.
+  // The code now uses textContent directly which is safer and more efficient.
 
   clearConsoleBtn.addEventListener('click', async () => {
     try {
@@ -410,12 +540,30 @@ function initializeMainUI() {
   loadTestStats();
 
   // refresh stats and console logs every 2 seconds while popup is open
-  setInterval(() => {
+  // Store reference for cleanup on unload
+  refreshIntervalId = setInterval(() => {
     loadTestStats();
 
     // only refresh console if console tab is visible
     if (consoleTab.style.display !== 'none') {
       loadConsoleLogs();
     }
-  }, 2000);
+  }, REFRESH_INTERVAL);
 }
+
+// Clean up interval when popup is closed to prevent memory leaks
+// This is important because the popup can be opened/closed many times
+window.addEventListener('unload', () => {
+  if (refreshIntervalId !== null) {
+    clearInterval(refreshIntervalId);
+    refreshIntervalId = null;
+  }
+});
+
+// Also clean up on beforeunload for broader browser support
+window.addEventListener('beforeunload', () => {
+  if (refreshIntervalId !== null) {
+    clearInterval(refreshIntervalId);
+    refreshIntervalId = null;
+  }
+});
