@@ -135,6 +135,24 @@
   }
 
   /**
+   * Validate XFLAG_RATE_LIMITED message structure
+   * @param {Object} data - Message data
+   * @returns {boolean} True if structure is valid
+   */
+  function isValidRateLimitedMessage(data) {
+    if (!isValidMessage(data, 'XFLAG_RATE_LIMITED')) {
+      return false;
+    }
+    if (typeof data.screenName !== 'string' || data.screenName.length === 0) {
+      return false;
+    }
+    if (!/^[a-zA-Z0-9_]{1,15}$/.test(data.screenName)) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Validate XFLAG_HEADERS_CAPTURED message structure
    * @param {Object} data - Message data
    * @returns {boolean} True if structure is valid
@@ -202,6 +220,16 @@
           } else if (screenName && location === null) {
             clearLoadingFlagsForUsername(screenName);
           }
+        }
+
+        if (data.type === 'XFLAG_RATE_LIMITED') {
+          if (!isValidRateLimitedMessage(data)) {
+            console.warn('[xflags] Invalid XFLAG_RATE_LIMITED message structure');
+            return;
+          }
+
+          const { screenName } = data;
+          convertToRateLimitedForUsername(screenName);
         }
 
         if (data.type === 'XFLAG_HEADERS_CAPTURED') {
@@ -285,6 +313,34 @@
           loadingFlag.remove();
           console.log(`[xflags] Removed loading flag for @${screenName}`);
         }
+      }
+    }
+  }
+
+  /**
+   * Convert loading flags to rate-limited state for a username
+   * Called when rate limiting occurs
+   * @param {string} screenName - X username
+   */
+  function convertToRateLimitedForUsername(screenName) {
+    // Try O(1) lookup first
+    const registeredElements = getElementsForUsername(screenName);
+
+    for (const tweet of registeredElements) {
+      if (document.contains(tweet)) {
+        window.xflagRenderer.convertToRateLimited(tweet, screenName);
+      }
+    }
+
+    // Fallback to DOM query
+    const tweets = document.querySelectorAll('article[data-testid="tweet"], [data-testid="UserCell"]');
+
+    for (const tweet of tweets) {
+      const username = window.xflagObserver.extractUsername(tweet);
+      if (username === screenName) {
+        // Register for future O(1) lookups
+        registerUsernameElement(screenName, tweet);
+        window.xflagRenderer.convertToRateLimited(tweet, screenName);
       }
     }
   }

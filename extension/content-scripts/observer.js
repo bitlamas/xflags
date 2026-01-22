@@ -143,16 +143,51 @@ class TweetObserver {
       window.xflagRegisterElement(username, tweetElement);
     }
 
-    window.xflagRenderer.renderLoadingFlag(tweetElement, username);
-
+    // Check cache first - if hit, render actual flag directly
     if (window.xflagCache.has(username)) {
+      window.xflagRenderer.renderLoadingFlag(tweetElement, username);
       const countryData = window.xflagCache.get(username);
       window.xflagRenderer.renderFlag(tweetElement, username, countryData);
-    } else {
-      if (window.xflagFetcher && !window.xflagFetcher.isRateLimited()) {
-        // Pass element reference for viewport-first priority queue
-        window.xflagFetcher.fetchUserLocation(username, tweetElement);
-      }
+      return;
+    }
+
+    // Check if already in deferred queue (rate-limited state)
+    if (window.xflagFetcher && window.xflagFetcher.isDeferred(username)) {
+      // Show rate-limited indicator directly for this element
+      this.renderRateLimitedFlag(tweetElement, username);
+      return;
+    }
+
+    // Check if currently rate limited - new usernames go to deferred queue
+    if (window.xflagFetcher && window.xflagFetcher.isRateLimited()) {
+      // Show rate-limited indicator directly (not loading then convert)
+      this.renderRateLimitedFlag(tweetElement, username);
+      // Add to deferred queue for later processing (already converted = true)
+      window.xflagFetcher.addToDeferred(username, tweetElement, true);
+      return;
+    }
+
+    // Normal path: show loading flag and queue fetch
+    window.xflagRenderer.renderLoadingFlag(tweetElement, username);
+
+    if (window.xflagFetcher) {
+      // Pass element reference for viewport-first priority queue
+      window.xflagFetcher.fetchUserLocation(username, tweetElement);
+    }
+  }
+
+  /**
+   * Render rate-limited flag for a tweet element
+   * Used when element is found for a username already in deferred queue
+   * @param {HTMLElement} tweetElement - Tweet or UserCell element
+   * @param {string} username - X username
+   * @private
+   */
+  renderRateLimitedFlag(tweetElement, username) {
+    // First render loading flag, then convert to rate-limited
+    const loadingRendered = window.xflagRenderer.renderLoadingFlag(tweetElement, username);
+    if (loadingRendered) {
+      window.xflagRenderer.convertToRateLimited(tweetElement, username);
     }
   }
 

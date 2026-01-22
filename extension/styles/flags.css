@@ -110,6 +110,62 @@
   margin-left: 3px;
 }
 
+/* Rate-limited indicator - clock icon showing request is queued */
+.xflag-rate-limited-box {
+  width: 16px;
+  height: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  position: relative;
+  color: #657786; /* Muted gray */
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+
+/* Clock icon using CSS */
+.xflag-rate-limited-box::before {
+  content: '';
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid #657786;
+  border-radius: 50%;
+  position: absolute;
+}
+
+/* Clock hands */
+.xflag-rate-limited-box::after {
+  content: '';
+  position: absolute;
+  width: 0;
+  height: 0;
+  /* Hour hand pointing to 12 */
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  border-bottom: 3px solid #657786;
+  transform: translateY(-1px);
+}
+
+/* Minute hand */
+.xflag-clock-minute {
+  position: absolute;
+  width: 1px;
+  height: 4px;
+  background: #657786;
+  transform-origin: bottom center;
+  transform: rotate(90deg) translateY(-1px);
+  top: 2px;
+}
+
+/* Alternative: hourglass using unicode (fallback for simpler rendering) */
+.xflag-rate-limited-text {
+  font-size: 9px;
+  color: #657786;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
 /* Tooltip styling (native title attribute) */
 .xflag-country:hover {
   opacity: 0.8;

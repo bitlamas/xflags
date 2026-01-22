@@ -16,6 +16,7 @@ class FlagRenderer {
   constructor() {
     this.processedElements = new WeakSet();
     this.loadingElements = new WeakMap();
+    this.rateLimitedElements = new WeakMap();
   }
 
   /**
@@ -129,6 +130,119 @@ class FlagRenderer {
     container.appendChild(loadingBox);
 
     return container;
+  }
+
+  /**
+   * Create rate-limited indicator element
+   * Shows a static clock icon indicating the request is queued
+   * @returns {HTMLElement} Rate-limited indicator element
+   */
+  createRateLimitedFlagElement() {
+    const container = document.createElement('span');
+    container.className = 'xflag-country';
+    container.setAttribute('data-xflag', 'true');
+    container.setAttribute('data-rate-limited', 'true');
+    container.setAttribute('role', 'status');
+    container.setAttribute('aria-label', 'Rate limited - queued for retry');
+
+    // clock icon box
+    const rateLimitedBox = document.createElement('div');
+    rateLimitedBox.className = 'xflag-rate-limited-box';
+    rateLimitedBox.title = 'Rate limited - will retry automatically in a few minutes';
+
+    // minute hand element
+    const minuteHand = document.createElement('span');
+    minuteHand.className = 'xflag-clock-minute';
+    rateLimitedBox.appendChild(minuteHand);
+
+    container.appendChild(rateLimitedBox);
+
+    return container;
+  }
+
+  /**
+   * Convert loading flags to rate-limited state for a username
+   * Called when rate limiting is detected
+   * @param {HTMLElement} container - Tweet or UserCell container element
+   * @param {string} screenName - X username (without @)
+   * @returns {boolean} True if conversion was successful
+   */
+  convertToRateLimited(container, screenName) {
+    const displayNameElement = this.findDisplayName(container, screenName);
+    if (!displayNameElement) {
+      return false;
+    }
+
+    const existingFlag = displayNameElement.parentNode?.querySelector('[data-xflag]');
+    const isLoadingFlag = existingFlag && existingFlag.getAttribute('data-loading') === 'true';
+
+    if (!isLoadingFlag) {
+      return false;
+    }
+
+    const rateLimitedFlag = this.createRateLimitedFlagElement();
+
+    try {
+      existingFlag.replaceWith(rateLimitedFlag);
+      this.loadingElements.delete(container);
+      this.rateLimitedElements.set(container, rateLimitedFlag);
+      console.log(`[xflags] Converted @${screenName} to rate-limited state`);
+      return true;
+    } catch (error) {
+      console.error('[xflags] Error converting to rate-limited state:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get all containers that are in rate-limited state
+   * @returns {Array<{container: HTMLElement, element: HTMLElement}>} Array of rate-limited containers
+   */
+  getRateLimitedContainers() {
+    const result = [];
+    // WeakMap doesn't have iteration, so we query the DOM
+    const rateLimitedFlags = document.querySelectorAll('[data-xflag][data-rate-limited="true"]');
+    for (const flag of rateLimitedFlags) {
+      const container = flag.closest('article[data-testid="tweet"], [data-testid="UserCell"]');
+      if (container) {
+        result.push({ container, element: flag });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Convert rate-limited flag back to loading state
+   * Called when processing resumes from deferred queue
+   * @param {HTMLElement} container - Tweet or UserCell container element
+   * @param {string} screenName - X username (without @)
+   * @returns {boolean} True if conversion was successful
+   */
+  convertToLoading(container, screenName) {
+    const displayNameElement = this.findDisplayName(container, screenName);
+    if (!displayNameElement) {
+      return false;
+    }
+
+    const existingFlag = displayNameElement.parentNode?.querySelector('[data-xflag]');
+    const isRateLimitedFlag = existingFlag && existingFlag.getAttribute('data-rate-limited') === 'true';
+
+    if (!isRateLimitedFlag) {
+      return false;
+    }
+
+    const loadingFlag = this.createLoadingFlagElement();
+
+    try {
+      existingFlag.replaceWith(loadingFlag);
+      this.rateLimitedElements.delete(container);
+      this.loadingElements.set(container, loadingFlag);
+      console.log(`[xflags] Converted @${screenName} back to loading state`);
+      return true;
+    } catch (error) {
+      console.error('[xflags] Error converting to loading state:', error);
+      return false;
+    }
   }
 
   /**
