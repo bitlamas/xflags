@@ -16,7 +16,83 @@
   // Headers stored in closure - not exposed globally or via postMessage unnecessarily
   // This minimizes the exposure of sensitive auth tokens
   let capturedHeaders = null;
-  let headersSentToExtension = false;
+  let lastSentHeadersKey = null;
+
+  const QUERY_ID_PATTERN = /^[A-Za-z0-9_-]{10,40}$/;
+  const ABOUT_QUERY_URL_PATTERN = /\/graphql\/([A-Za-z0-9_-]+)\/AboutAccountQuery/;
+  let lastSentQueryId = null;
+
+  /**
+   * Report the AboutAccountQuery queryId seen in X's own traffic
+   * @param {string} url - Request URL
+   */
+  function captureQueryIdFromUrl(url) {
+    if (typeof url !== 'string' || !url.includes('AboutAccountQuery')) return;
+    const match = url.match(ABOUT_QUERY_URL_PATTERN);
+    if (!match || match[1] === lastSentQueryId) return;
+    lastSentQueryId = match[1];
+    window.postMessage({
+      type: 'XFLAG_QUERY_ID',
+      queryId: match[1],
+      source: 'traffic'
+    }, window.location.origin);
+  }
+
+  /**
+   * Search X's loaded JS bundles for the AboutAccountQuery queryId
+   * Uses the original fetch (served from the browser cache in practice)
+   * @returns {Promise<string|null>}
+   */
+  async function discoverQueryIdFromBundles() {
+    const urls = new Set();
+    try {
+      for (const entry of performance.getEntriesByType('resource')) {
+        if (/^https:\/\/abs\.twimg\.com\/responsive-web\/.+\.js(\?|$)/.test(entry.name)) {
+          urls.add(entry.name);
+        }
+      }
+    } catch (e) {
+      // Performance API unavailable
+    }
+    for (const script of document.querySelectorAll('script[src]')) {
+      if (/^https:\/\/abs\.twimg\.com\/responsive-web\/.+\.js/.test(script.src)) {
+        urls.add(script.src);
+      }
+    }
+
+    // main.* holds most operation definitions, check it first
+    const ordered = [...urls].sort((a, b) => (/\/main\./.test(b) ? 1 : 0) - (/\/main\./.test(a) ? 1 : 0));
+    const pattern = /queryId:\s*"([A-Za-z0-9_-]+)"\s*,\s*operationName:\s*"AboutAccountQuery"/;
+
+    for (const url of ordered.slice(0, 80)) {
+      try {
+        const response = await originalFetch.call(window, url, { credentials: 'omit' });
+        if (!response.ok) continue;
+        const text = await response.text();
+        const match = text.match(pattern);
+        if (match && QUERY_ID_PATTERN.test(match[1])) {
+          return match[1];
+        }
+      } catch (e) {
+        // Skip unreadable bundle
+      }
+    }
+    return null;
+  }
+
+  // Content script asks us to look for a fresh queryId when the current one returns 400/404
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || event.origin !== window.location.origin) return;
+    if (!event.data || event.data.type !== 'XFLAG_DISCOVER_QUERY_ID') return;
+
+    discoverQueryIdFromBundles().then((queryId) => {
+      window.postMessage({
+        type: 'XFLAG_QUERY_ID',
+        queryId: queryId,
+        source: 'bundle'
+      }, window.location.origin);
+    });
+  });
 
   /**
    * Capture auth headers from X's API requests
@@ -53,10 +129,11 @@
     if (Object.keys(newHeaders).length > 0 && newHeaders.authorization) {
       capturedHeaders = newHeaders;
 
-      // Send headers to extension context only once (or when they change)
+      // Send headers to extension context only when they change (e.g. CSRF token rotated)
       // This minimizes exposure of sensitive data via postMessage
-      if (!headersSentToExtension) {
-        headersSentToExtension = true;
+      const key = JSON.stringify(newHeaders);
+      if (key !== lastSentHeadersKey) {
+        lastSentHeadersKey = key;
         // Security: Use specific origin instead of '*' to prevent cross-origin message interception
         window.postMessage({
           type: 'XFLAG_HEADERS_CAPTURED',
@@ -241,7 +318,9 @@
   // intercept fetch - use defineProperty to prevent X from overwriting it
   const originalFetch = window.fetch;
   const interceptedFetch = async function(...args) {
-    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+    const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || (args[0] instanceof URL ? args[0].href : undefined));
+
+    captureQueryIdFromUrl(url);
 
     // capture headers from X's graphql api calls (though X uses XHR, not fetch)
     if (url && url.includes('x.com/i/api/graphql')) {
@@ -306,8 +385,9 @@
   const originalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this._xflagURL = url;
+    this._xflagURL = typeof url === 'string' ? url : String(url);
     this._xflagHeaders = {};
+    captureQueryIdFromUrl(this._xflagURL);
 
     return originalXHROpen.apply(this, [method, url, ...rest]);
   };
@@ -325,9 +405,8 @@
       if (!this._xflagHeadersLogged) {
         this._xflagHeadersLogged = true;
 
-        if (!capturedHeaders || Object.keys(capturedHeaders).length < 3) {
-          captureHeaders(this._xflagHeaders);
-        }
+        // Always re-check: captureHeaders only forwards them when something changed
+        captureHeaders(this._xflagHeaders);
       }
     }
   };

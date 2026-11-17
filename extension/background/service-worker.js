@@ -1,6 +1,12 @@
 // service-worker.js - Background service worker for xflags extension
 // Acts as central coordinator for all tabs with unified cache and request deduplication
 
+// Chrome runs this file as a service worker (importScripts available);
+// Firefox loads utils/rate-limit-policy.js via manifest background.scripts instead.
+if (typeof importScripts === 'function' && typeof self.XflagRatePolicy === 'undefined') {
+  importScripts('../utils/rate-limit-policy.js');
+}
+
 /**
  * Service Worker Message Types
  * Used for communication between content scripts and service worker
@@ -23,6 +29,8 @@ const SW_MESSAGE_TYPES = {
   // Rate limiting coordination
   RATE_LIMIT_STATUS: 'SW_RATE_LIMIT_STATUS',
   RATE_LIMIT_SET: 'SW_RATE_LIMIT_SET',
+  RATE_LIMIT_ACQUIRE: 'SW_RATE_LIMIT_ACQUIRE',
+  RATE_LIMIT_REPORT: 'SW_RATE_LIMIT_REPORT',
 
   // Error logging
   ERROR_LOG: 'SW_ERROR_LOG',
@@ -279,45 +287,37 @@ class UnifiedCache {
 
 /**
  * RequestDeduplicator - Prevents duplicate API requests across tabs
- * Tracks in-flight requests and broadcasts results to all waiting tabs
+ *
+ * One tab "claims" a username and fetches it; other tabs wait for its result.
+ * Claims are released when:
+ * - the owning tab reports completion (success OR failure)
+ * - the owning tab's page goes away (its long-lived port disconnects)
+ * - the claim is older than CLAIM_TIMEOUT (backstop for crashed tabs)
+ * Waiters are released after WAIT_TIMEOUT with status 'timeout' so they can fetch themselves.
  */
 class RequestDeduplicator {
   constructor() {
-    /**
-     * Map of username -> array of callback ports waiting for the result
-     * @type {Map<string, Array<{tabId: number, resolve: Function}>>}
-     */
-    this.inFlightRequests = new Map();
+    /** @type {Map<string, {tabId: number, startedAt: number, waiters: Array<{resolve: Function, timer: number}>}>} */
+    this.claims = new Map();
 
-    /**
-     * Map of username -> timestamp when request started
-     * Used for timeout handling
-     * @type {Map<string, number>}
-     */
-    this.requestStartTimes = new Map();
+    /** Backstop for claims whose owner vanished without telling us (5 minutes) */
+    this.CLAIM_TIMEOUT = 5 * 60 * 1000;
 
-    /**
-     * Request timeout in milliseconds (30 seconds)
-     * @type {number}
-     */
-    this.requestTimeout = 30000;
+    /** How long a waiting tab waits before giving up and fetching itself */
+    this.WAIT_TIMEOUT = 60 * 1000;
   }
 
   /**
-   * Check if a request is already in-flight for this username
+   * Check if a fresh claim exists for this username
    * @param {string} username - X username
-   * @returns {boolean} True if request is in-flight
+   * @returns {boolean}
    */
   isInFlight(username) {
-    if (!this.inFlightRequests.has(username)) {
-      return false;
-    }
+    const claim = this.claims.get(username);
+    if (!claim) return false;
 
-    // Check for stale requests (timeout)
-    const startTime = this.requestStartTimes.get(username);
-    if (startTime && Date.now() - startTime > this.requestTimeout) {
-      // Request timed out, clean up
-      this.completeRequest(username, null);
+    if (Date.now() - claim.startedAt > this.CLAIM_TIMEOUT) {
+      this.completeRequest(username, null, 'timeout');
       return false;
     }
 
@@ -325,83 +325,77 @@ class RequestDeduplicator {
   }
 
   /**
-   * Register a new request or add to existing waiters
+   * Claim a username for fetching
    * @param {string} username - X username
-   * @param {number} tabId - Tab ID making the request
-   * @returns {{isNew: boolean, promise: Promise<Object|null>}} Whether this is a new request and promise for result
+   * @param {number} tabId - Tab that will fetch
    */
-  registerRequest(username, tabId) {
-    const isNew = !this.isInFlight(username);
-
-    return new Promise((resolve) => {
-      if (!this.inFlightRequests.has(username)) {
-        this.inFlightRequests.set(username, []);
-        this.requestStartTimes.set(username, Date.now());
-      }
-
-      this.inFlightRequests.get(username).push({ tabId, resolve });
-
-      // If this is not a new request, the result will come from the existing request
-      // The caller should only make the API call if isNew is true
-      if (!isNew) {
-        // Return immediately - the existing request will resolve this promise
-        return;
-      }
-    }).then(result => ({ isNew, result }));
+  startRequest(username, tabId) {
+    if (!this.claims.has(username)) {
+      this.claims.set(username, { tabId, startedAt: Date.now(), waiters: [] });
+    }
   }
 
   /**
-   * Wait for an existing request to complete
+   * Wait for another tab's claim to complete
    * @param {string} username - X username
-   * @param {number} tabId - Tab ID waiting for result
-   * @returns {Promise<Object|null>} Promise that resolves with the result
+   * @returns {Promise<{data: Object|null, status: string}>}
    */
-  waitForRequest(username, tabId) {
+  waitForRequest(username) {
     return new Promise((resolve) => {
-      if (!this.inFlightRequests.has(username)) {
-        // No request in flight, shouldn't happen but handle gracefully
-        resolve(null);
+      const claim = this.claims.get(username);
+      if (!claim) {
+        resolve({ data: null, status: 'timeout' });
         return;
       }
 
-      this.inFlightRequests.get(username).push({ tabId, resolve });
+      const waiter = { resolve, timer: null };
+      waiter.timer = setTimeout(() => {
+        const current = this.claims.get(username);
+        if (current) {
+          current.waiters = current.waiters.filter(w => w !== waiter);
+        }
+        resolve({ data: null, status: 'timeout' });
+      }, this.WAIT_TIMEOUT);
+
+      claim.waiters.push(waiter);
     });
   }
 
   /**
-   * Start tracking a new request
+   * Complete a claim and notify all waiting tabs
    * @param {string} username - X username
-   * @param {number} tabId - Tab ID making the request
+   * @param {Object|null} data - Location data or null
+   * @param {string} status - 'ok' | 'nodata' | 'failed' | 'timeout'
    */
-  startRequest(username, tabId) {
-    if (!this.inFlightRequests.has(username)) {
-      this.inFlightRequests.set(username, []);
-      this.requestStartTimes.set(username, Date.now());
+  completeRequest(username, data, status) {
+    const claim = this.claims.get(username);
+    this.claims.delete(username);
+    if (!claim) return;
+
+    if (claim.waiters.length > 0) {
+      console.log(`[xflags SW] Completing @${username} (${status}), notifying ${claim.waiters.length} waiter(s)`);
+    }
+
+    for (const waiter of claim.waiters) {
+      clearTimeout(waiter.timer);
+      try {
+        waiter.resolve({ data, status });
+      } catch (error) {
+        console.error('[xflags SW] Error notifying waiter:', error);
+      }
     }
   }
 
   /**
-   * Complete a request and notify all waiting tabs
-   * @param {string} username - X username
-   * @param {Object|null} result - Location data or null if failed
+   * Release every claim owned by a tab (page unloaded / navigated / closed)
+   * @param {number} tabId
    */
-  completeRequest(username, result) {
-    const waiters = this.inFlightRequests.get(username);
-
-    if (waiters && waiters.length > 0) {
-      console.log(`[xflags SW] Completing request for @${username}, notifying ${waiters.length} waiter(s)`);
-
-      for (const waiter of waiters) {
-        try {
-          waiter.resolve(result);
-        } catch (error) {
-          console.error('[xflags SW] Error notifying waiter:', error);
-        }
+  releaseTab(tabId) {
+    for (const [username, claim] of [...this.claims]) {
+      if (claim.tabId === tabId) {
+        this.completeRequest(username, null, 'failed');
       }
     }
-
-    this.inFlightRequests.delete(username);
-    this.requestStartTimes.delete(username);
   }
 
   /**
@@ -409,39 +403,70 @@ class RequestDeduplicator {
    * @returns {number} Number of pending requests
    */
   getPendingCount() {
-    return this.inFlightRequests.size;
+    return this.claims.size;
   }
 }
 
 /**
- * RateLimitCoordinator - Manages rate limiting state across all tabs
+ * RateLimitCoordinator - One request budget shared by all tabs
+ *
+ * Wraps XflagRatePolicy.RateBudget and persists it to storage.session so the
+ * cooldown survives the service worker being suspended.
  */
 class RateLimitCoordinator {
   constructor() {
-    /** @type {boolean} Whether currently rate limited */
-    this.isRateLimited = false;
+    this.budget = new self.XflagRatePolicy.RateBudget();
+    this.loaded = false;
+    this.STORAGE_KEY = 'xflag_rate_budget';
+  }
 
-    /** @type {number|null} Timestamp when rate limit expires */
-    this.rateLimitExpiry = null;
+  #area() {
+    const api = typeof browser !== 'undefined' ? browser : chrome;
+    return api.storage.session || api.storage.local;
+  }
 
-    /** @type {number} Cooldown duration in milliseconds (5 minutes) */
-    this.cooldownDuration = 300000;
+  async load() {
+    if (this.loaded) return;
+    try {
+      const result = await this.#area().get(this.STORAGE_KEY);
+      this.budget.restore(result[this.STORAGE_KEY]);
+    } catch (error) {
+      console.warn('[xflags SW] Could not restore rate budget:', error);
+    }
+    this.loaded = true;
+  }
+
+  #persist() {
+    this.#area().set({ [this.STORAGE_KEY]: this.budget.toJSON() }).catch(() => {});
   }
 
   /**
-   * Set rate limited state
-   * @param {boolean} limited - Whether rate limited
+   * Reserve the next request slot (global across tabs)
+   * @returns {{waitMs: number, cooldown: boolean}}
    */
-  setRateLimited(limited) {
-    this.isRateLimited = limited;
+  acquire() {
+    const slot = this.budget.acquire();
+    this.#persist();
+    return slot;
+  }
 
-    if (limited) {
-      this.rateLimitExpiry = Date.now() + this.cooldownDuration;
-      console.log('[xflags SW] Rate limited, cooldown until:', new Date(this.rateLimitExpiry).toISOString());
-    } else {
-      this.rateLimitExpiry = null;
-      console.log('[xflags SW] Rate limit cleared');
-    }
+  /**
+   * Record x-rate-limit-* headers reported by a tab
+   * @param {Object} info - parsed headers (resetAt is an absolute local timestamp)
+   */
+  report(info) {
+    this.budget.update(info);
+    this.#persist();
+  }
+
+  /**
+   * Enter cooldown until an absolute timestamp
+   * @param {number} until - epoch ms
+   */
+  setCooldown(until) {
+    this.budget.setCooldown(until);
+    console.log('[xflags SW] Rate limited, cooldown until:', new Date(this.budget.cooldownUntil).toISOString());
+    this.#persist();
   }
 
   /**
@@ -449,15 +474,10 @@ class RateLimitCoordinator {
    * @returns {{isRateLimited: boolean, expiresIn: number|null}} Rate limit status
    */
   getStatus() {
-    // Check if rate limit has expired
-    if (this.isRateLimited && this.rateLimitExpiry && Date.now() >= this.rateLimitExpiry) {
-      this.isRateLimited = false;
-      this.rateLimitExpiry = null;
-    }
-
+    const remaining = this.budget.cooldownRemaining();
     return {
-      isRateLimited: this.isRateLimited,
-      expiresIn: this.rateLimitExpiry ? Math.max(0, this.rateLimitExpiry - Date.now()) : null
+      isRateLimited: remaining > 0,
+      expiresIn: remaining > 0 ? remaining : null
     };
   }
 }
@@ -750,11 +770,10 @@ function handleMessage(message, sender, sendResponse) {
             return { success: true, cached: true, data: cached };
           }
 
-          // Check if request is already in-flight
+          // Another tab is fetching it: wait for that result (bounded by WAIT_TIMEOUT)
           if (requestDeduplicator.isInFlight(message.username)) {
-            // Wait for existing request
-            const result = await requestDeduplicator.waitForRequest(message.username, tabId);
-            return { success: true, cached: false, waited: true, data: result };
+            const { data: waitedData, status } = await requestDeduplicator.waitForRequest(message.username);
+            return { success: true, cached: false, waited: true, status, data: waitedData };
           }
 
           // New request - caller should make the API call
@@ -766,16 +785,33 @@ function handleMessage(message, sender, sendResponse) {
           if (message.data && message.data.location) {
             unifiedCache.set(message.username, message.data.location, message.data.accurate);
           }
-          requestDeduplicator.completeRequest(message.username, message.data);
+          requestDeduplicator.completeRequest(
+            message.username,
+            message.data || null,
+            message.status || (message.data ? 'ok' : 'failed')
+          );
           return { success: true };
 
-        // Rate limiting
+        // Rate limiting (one budget for all tabs)
         case SW_MESSAGE_TYPES.RATE_LIMIT_STATUS:
+          await rateLimitCoordinator.load();
           return { success: true, ...rateLimitCoordinator.getStatus() };
 
-        case SW_MESSAGE_TYPES.RATE_LIMIT_SET:
-          rateLimitCoordinator.setRateLimited(message.isRateLimited);
+        case SW_MESSAGE_TYPES.RATE_LIMIT_ACQUIRE:
+          await rateLimitCoordinator.load();
+          return { success: true, ...rateLimitCoordinator.acquire() };
+
+        case SW_MESSAGE_TYPES.RATE_LIMIT_REPORT:
+          await rateLimitCoordinator.load();
+          rateLimitCoordinator.report(message.info);
           return { success: true };
+
+        case SW_MESSAGE_TYPES.RATE_LIMIT_SET:
+          await rateLimitCoordinator.load();
+          if (message.isRateLimited && typeof message.until === 'number') {
+            rateLimitCoordinator.setCooldown(message.until);
+          }
+          return { success: true, ...rateLimitCoordinator.getStatus() };
 
         // Error logging
         case SW_MESSAGE_TYPES.ERROR_LOG:
@@ -818,12 +854,25 @@ function handleMessage(message, sender, sendResponse) {
 const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
 browserAPI.runtime.onMessage.addListener(handleMessage);
 
+// Each content script keeps a port open; when the page unloads the port
+// disconnects and we release that tab's claims so other tabs don't wait on them.
+browserAPI.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'xflag-tab') return;
+  const tabId = port.sender?.tab?.id;
+  port.onDisconnect.addListener(() => {
+    if (typeof tabId === 'number') {
+      requestDeduplicator.releaseTab(tabId);
+    }
+  });
+});
+
 // Initialize on service worker start
 (async function init() {
   console.log('[xflags SW] Service worker starting...');
 
   await unifiedCache.load();
   await errorCollector.load();
+  await rateLimitCoordinator.load();
 
   console.log('[xflags SW] Service worker initialized');
 })();

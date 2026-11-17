@@ -45,6 +45,10 @@ const runtime = {
     return browserAPI.runtime.sendMessage(message);
   },
 
+  connect(connectInfo) {
+    return browserAPI.runtime.connect(connectInfo);
+  },
+
   onMessage: browserAPI.runtime.onMessage
 };
 

@@ -32,8 +32,11 @@ const PRIORITY = {
  * ActiveFetcher - Manages queue-based API requests with rate limiting and priority
  *
  * Implements conservative request strategy:
- * - 5-second minimum intervals between requests
- * - 5-minute cooldown on 429 rate limit errors
+ * - Requests paced against X's x-rate-limit-* headers, shared by all tabs (see utils/rate-limit-policy.js)
+ * - On 429, cool down until X's x-rate-limit-reset (fallback 5 minutes), shared by all tabs
+ * - Per-request timeout (AbortController) covering headers and body
+ * - Retries with backoff for network errors/timeouts/5xx only (never 4xx)
+ * - AboutAccountQuery queryId learned from live traffic / X's JS bundles, rotated on 400/404
  * - Auto-retry queued users after cooldown
  * - Explicit state tracking (active/idle/rate-limited)
  * - Viewport-first priority queue (visible users processed first)
@@ -43,13 +46,32 @@ const PRIORITY = {
  *
  * @class
  */
+/**
+ * Known AboutAccountQuery queryIds, newest-known first after the original.
+ * The live one is learned from X's own traffic / JS bundles at runtime; these are fallbacks.
+ */
+const DEFAULT_QUERY_IDS = [
+  'XRqGa7EeokUU5kppkh13EA',
+  'TzOG2twZEfhr9KmClvVVqA'
+];
+const QUERY_ID_STORAGE_KEY = 'xflag_about_query_id';
+const QUERY_ID_PATTERN = /^[A-Za-z0-9_-]{10,40}$/;
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 class ActiveFetcher {
   // Private class fields for encapsulation
-  #minInterval = 5000; // 5 seconds between requests
-  #cooldown429 = 300000; // 5 minute cooldown after 429
-  #deferredInterval = 5000; // 5 seconds between deferred queue requests
+  #deferredInterval = 1000; // pause between deferred items (actual pacing is done by the rate budget)
   #idleThreshold = 60000; // 1 minute of no scroll = idle
-  #lastRequestTime = 0;
+  /** Local budget, used only when the background is unreachable */
+  #localBudget = new window.XflagRatePolicy.RateBudget();
+
+  // AboutAccountQuery queryId handling
+  #queryId = DEFAULT_QUERY_IDS[0];
+  /** @type {Set<string>} queryIds that returned 400/404 */
+  #badQueryIds = new Set();
+  /** @type {Function|null} resolver for an in-progress bundle discovery */
+  #pendingDiscovery = null;
   /** @type {QueueItem[]} Priority queue of requests */
   #requestQueue = [];
   #processing = false;
@@ -96,6 +118,7 @@ class ActiveFetcher {
   #onRateLimitEnd = null;
 
   constructor() {
+    this.#loadStoredQueryId();
     this.#setupViewportObserver();
     this.#setupPriorityUpdateInterval();
     this.#setupIdleDetection();
@@ -343,7 +366,7 @@ class ActiveFetcher {
    * @returns {boolean} True if headers are valid and set, false otherwise
    */
   setHeaders(headers) {
-    if (!headers || !headers.authorization || !headers['x-csrf-token']) {
+    if (!headers || !headers.authorization) {
       return false;
     }
 
@@ -396,28 +419,37 @@ class ActiveFetcher {
       try {
         const result = await window.xflagCache.requestLocation(screenName);
 
-        if (result.cached || result.waited) {
-          // Data was available from cache or another tab's request
-          console.log(`[xflags] @${screenName} found in service worker cache, data:`, result.data);
+        const waitedWithAnswer = result.waited && (result.data || result.status === 'nodata');
 
-          // Post message to update the flag (processTweet doesn't use return value)
+        if (result.cached || waitedWithAnswer) {
+          // Data was available from cache or another tab's request
+          console.log(`[xflags] @${screenName} resolved via service worker, data:`, result.data);
+
           if (result.data) {
             const location = result.data.location || result.data.country || result.data;
             const accurate = result.data.accurate !== false;
-            console.log(`[xflags] @${screenName} posting cached location: ${location}`);
             window.postMessage({
               type: 'XFLAG_FETCH_RESPONSE',
               screenName: screenName,
               location: typeof location === 'string' ? location : null,
               accurate: accurate
             }, window.location.origin);
+          } else {
+            // Another tab confirmed this account has no location data
+            window.postMessage({
+              type: 'XFLAG_FETCH_RESPONSE',
+              screenName: screenName,
+              location: 'undefined',
+              accurate: false
+            }, window.location.origin);
           }
           return result.data;
         }
 
-        if (!result.shouldFetch) {
-          // Another tab is already fetching, wait handled by service worker
-          console.log(`[xflags] @${screenName} being fetched by another tab`);
+        if (result.waited) {
+          // The tab that claimed it failed, timed out or went away: fetch it ourselves
+          console.log(`[xflags] @${screenName} other tab's request ${result.status || 'failed'}, fetching locally`);
+        } else if (!result.shouldFetch) {
           return null;
         }
       } catch (error) {
@@ -467,9 +499,8 @@ class ActiveFetcher {
   }
 
   /**
-   * Process queued requests with rate limiting
-   * Enforces 5-second intervals between requests
-   * Always picks highest priority item first
+   * Process queued requests, paced by the shared rate budget
+   * Always picks the highest priority item at the moment a slot is available
    * @private
    */
   async #processQueue() {
@@ -486,65 +517,165 @@ class ActiveFetcher {
 
     // Update state to active when starting to process queue
     if (this.#fetcherState === 'idle') {
-      this.#fetcherState = 'active';
-      if (window.xflagConsole && window.xflagConsole.setFetcherState) {
-        window.xflagConsole.setFetcherState('active');
-      }
+      this.#setState('active');
     }
 
-    while (this.#requestQueue.length > 0 && !this.#rateLimited && !this.#paused) {
-      // Re-evaluate and sort priorities before picking next item
-      this.#updateQueuePriorities();
+    try {
+      while (this.#requestQueue.length > 0 && !this.#rateLimited && !this.#paused) {
+        // Reserve a request slot (shared across tabs when the background is available)
+        const slot = await this.#acquireSlot();
+        if (slot.cooldown) {
+          // Another tab hit a 429: join the shared cooldown
+          this.#handleRateLimit(slot.waitMs);
+          break;
+        }
+        if (slot.waitMs > 0) {
+          await sleep(slot.waitMs);
+        }
+        if (this.#rateLimited || this.#paused || this.#requestQueue.length === 0) break;
 
-      // Rate limiting: enforce minimum interval
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.#lastRequestTime;
+        // Re-evaluate priorities now that we're about to send
+        this.#updateQueuePriorities();
+        const item = this.#requestQueue.shift();
+        const { screenName, resolve, element } = item;
 
-      if (timeSinceLastRequest < this.#minInterval) {
-        const waitTime = this.#minInterval - timeSinceLastRequest;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-
-      // Get highest priority item (first in sorted queue)
-      const item = this.#requestQueue.shift();
-      const { screenName, resolve, element } = item;
-
-      this.#lastRequestTime = Date.now();
-
-      try {
-        const data = await this.#makeRequest(screenName);
-
-        // Notify service worker that request is complete
-        if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
-          await window.xflagCache.completeRequest(screenName, data);
+        let outcome = { status: 'failed', data: null };
+        try {
+          outcome = await this.#fetchWithRetries(screenName);
+        } catch (error) {
+          console.error(`[xflags] Unexpected error fetching @${screenName}:`, error);
         }
 
-        resolve(data);
-      } catch (error) {
-        // Notify service worker of failure
-        if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
-          await window.xflagCache.completeRequest(screenName, null);
+        if (outcome.status === 'ratelimited') {
+          // Don't lose the user we were fetching: defer it with the rest of the queue
+          this.addToDeferred(screenName, element);
+          window.postMessage({ type: 'XFLAG_RATE_LIMITED', screenName }, window.location.origin);
+        } else if (outcome.status === 'failed') {
+          // Remove the loading spinner rather than leaving it forever
+          window.postMessage({
+            type: 'XFLAG_FETCH_RESPONSE',
+            screenName,
+            location: null,
+            accurate: false
+          }, window.location.origin);
         }
 
-        resolve(null);
+        // Release the cross-tab claim on every path (success, no data, failure, 429)
+        if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
+          const swStatus = outcome.status === 'ok' || outcome.status === 'nodata' ? outcome.status : 'failed';
+          await window.xflagCache.completeRequest(screenName, outcome.data, swStatus);
+        }
+
+        resolve(outcome.data);
+
+        if (outcome.status !== 'ratelimited') {
+          this.untrackElement(screenName);
+        }
+      }
+    } finally {
+      this.#processing = false;
+
+      // Update state to idle when queue is empty
+      if (this.#requestQueue.length === 0 && !this.#rateLimited) {
+        this.#setState('idle');
+      }
+    }
+  }
+
+  /**
+   * Update fetcher state and the console indicator
+   * @param {string} state - 'active' | 'idle' | 'rate-limited'
+   * @private
+   */
+  #setState(state) {
+    this.#fetcherState = state;
+    if (window.xflagConsole && window.xflagConsole.setFetcherState) {
+      window.xflagConsole.setFetcherState(state);
+    }
+  }
+
+  /**
+   * Reserve the next request slot from the shared budget, or the local one as fallback
+   * @returns {Promise<{waitMs: number, cooldown: boolean}>}
+   * @private
+   */
+  async #acquireSlot() {
+    if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
+      const shared = await window.xflagCache.acquireRequestSlot();
+      if (shared) return shared;
+    }
+    return this.#localBudget.acquire();
+  }
+
+  /**
+   * Record x-rate-limit-* headers locally and in the shared budget
+   * @param {Object} info - Parsed headers
+   * @private
+   */
+  #recordRateLimit(info) {
+    if (info.remaining === null && info.resetAt === null) return;
+    this.#localBudget.update(info);
+    if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
+      window.xflagCache.reportRateLimit(info);
+    }
+  }
+
+  /**
+   * Fetch one user, retrying transient failures and rotating a stale queryId
+   * @param {string} screenName - X username
+   * @returns {Promise<{status: string, data: Object|null}>}
+   *   status: 'ok' | 'nodata' | 'ratelimited' | 'failed'
+   * @private
+   */
+  async #fetchWithRetries(screenName) {
+    const { MAX_RETRIES, RETRY_BASE_MS } = window.XflagRatePolicy.POLICY;
+    let retries = 0;
+    let rotatedQueryId = false;
+
+    while (true) {
+      const outcome = await this.#makeRequest(screenName);
+
+      let tryAgain = false;
+      if (outcome.status === 'retry' && retries < MAX_RETRIES) {
+        retries++;
+        const backoff = RETRY_BASE_MS * Math.pow(2, retries - 1);
+        console.log(`[xflags] Retrying @${screenName} in ${backoff}ms (attempt ${retries + 1})`);
+        await sleep(backoff);
+        tryAgain = true;
+      } else if (outcome.status === 'staleQuery' && !rotatedQueryId) {
+        rotatedQueryId = true;
+        tryAgain = await this.#rotateQueryId();
       }
 
-      // Clean up tracking
-      this.untrackElement(screenName);
-
-      // Small delay to be extra safe
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    this.#processing = false;
-
-    // Update state to idle when queue is empty
-    if (this.#requestQueue.length === 0 && !this.#rateLimited) {
-      this.#fetcherState = 'idle';
-      if (window.xflagConsole && window.xflagConsole.setFetcherState) {
-        window.xflagConsole.setFetcherState('idle');
+      if (!tryAgain) {
+        if (outcome.status === 'retry' || outcome.status === 'staleQuery') {
+          return { status: 'failed', data: null };
+        }
+        return outcome;
       }
+
+      if (this.#rateLimited || this.#paused) {
+        return { status: 'failed', data: null };
+      }
+
+      // Every attempt goes through the budget
+      const slot = await this.#acquireSlot();
+      if (slot.cooldown) {
+        this.#handleRateLimit(slot.waitMs);
+        return { status: 'ratelimited', data: null };
+      }
+      if (slot.waitMs > 0) await sleep(slot.waitMs);
     }
+  }
+
+  /**
+   * Read X's CSRF token from the ct0 cookie (it can rotate during a session)
+   * @returns {string|null}
+   * @private
+   */
+  #readCsrfCookie() {
+    const match = document.cookie.match(/(?:^|;\s*)ct0=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
   }
 
   /**
@@ -604,72 +735,110 @@ class ActiveFetcher {
   }
 
   /**
-   * Make AboutAccountQuery API request for a specific user
+   * Make one AboutAccountQuery API request for a specific user
    * @param {string} screenName - X username (without @)
-   * @returns {Promise<Object|null>} Location data or null if unavailable
+   * @returns {Promise<{status: string, data: Object|null}>}
+   *   status: 'ok' | 'nodata' | 'ratelimited' | 'retry' | 'staleQuery' | 'failed'
    * @private
    */
   async #makeRequest(screenName) {
     if (!this.#capturedHeaders) {
       // This should not happen with the queue guard, but log if it does
       console.warn(`[xflags] Cannot fetch @${screenName} - no headers captured yet`);
-      return null;
+      return { status: 'failed', data: null };
     }
 
     if (this.#rateLimited) {
-      return null;
+      return { status: 'ratelimited', data: null };
     }
 
-    const url = `https://x.com/i/api/graphql/XRqGa7EeokUU5kppkh13EA/AboutAccountQuery?variables=${encodeURIComponent(JSON.stringify({ screenName }))}`;
+    const policy = window.XflagRatePolicy;
+    const queryId = this.#queryId;
+    const url = `https://x.com/i/api/graphql/${queryId}/AboutAccountQuery?variables=${encodeURIComponent(JSON.stringify({ screenName }))}`;
+    const csrf = this.#readCsrfCookie() || this.#capturedHeaders['x-csrf-token'];
+
+    // One timeout for the whole exchange: headers AND body
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), policy.POLICY.REQUEST_TIMEOUT_MS);
 
     try {
       const response = await fetch(url, {
         method: 'GET',
         headers: {
           'authorization': this.#capturedHeaders.authorization,
-          'x-csrf-token': this.#capturedHeaders['x-csrf-token'],
+          'x-csrf-token': csrf,
           'x-twitter-auth-type': this.#capturedHeaders['x-twitter-auth-type'] || 'OAuth2Session',
           'x-twitter-active-user': this.#capturedHeaders['x-twitter-active-user'] || 'yes',
           'x-twitter-client-language': this.#capturedHeaders['x-twitter-client-language'] || 'en',
           'content-type': 'application/json'
         },
-        credentials: 'include'
+        credentials: 'include',
+        signal: controller.signal
       });
 
+      const rateInfo = policy.parseRateLimitHeaders(response);
+      this.#recordRateLimit(rateInfo);
+
       if (response.status === 429) {
-        console.warn('[xflags] 429 Rate Limited - pausing for 5 minutes');
+        const cooldownMs = policy.cooldownFor429(rateInfo);
+        const minutes = Math.ceil(cooldownMs / 60000);
+        console.warn(`[xflags] 429 Rate Limited - pausing for ~${minutes} min`);
 
         if (window.xflagConsole) {
-          window.xflagConsole.log('error', '429 Rate Limited - pausing for 5 minutes');
+          window.xflagConsole.log('error', `429 Rate Limited - pausing for ~${minutes} min`);
         }
 
         if (window.xflagLogger) {
           window.xflagLogger.log429Error();
         }
 
-        // Notify service worker of rate limit
+        // Share the cooldown with all tabs
         if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
-          await window.xflagCache.setRateLimitStatus(true);
+          window.xflagCache.setRateLimitCooldown(Date.now() + cooldownMs);
         }
 
-        this.#handleRateLimit();
-        return null;
+        this.#handleRateLimit(cooldownMs);
+        return { status: 'ratelimited', data: null };
+      }
+
+      if (response.status === 400 || response.status === 404) {
+        // Most likely X rotated the queryId
+        console.warn(`[xflags] HTTP ${response.status} for @${screenName} with queryId ${queryId} - queryId may be stale`);
+        this.#logError({
+          action: 'fetchUserLocation',
+          message: `HTTP ${response.status} (queryId ${queryId})`,
+          context: { username: screenName, status: response.status }
+        });
+        return { status: 'staleQuery', data: null };
+      }
+
+      if (response.status >= 500) {
+        console.warn(`[xflags] HTTP ${response.status} for @${screenName} - will retry`);
+        return { status: 'retry', data: null };
       }
 
       if (!response.ok) {
+        // 401/403 etc: not retryable
         console.error(`[xflags] Fetch failed for @${screenName}: ${response.status}`);
 
-        // Log error if error logging is enabled
         this.#logError({
           action: 'fetchUserLocation',
           message: `HTTP ${response.status}: ${response.statusText}`,
           context: { username: screenName, status: response.status }
         });
 
-        return null;
+        return { status: 'failed', data: null };
       }
 
-      const data = await response.json();
+      let data;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        if (parseError.name === 'AbortError') throw parseError;
+        console.error(`[xflags] Invalid JSON for @${screenName}:`, parseError);
+        return { status: 'failed', data: null };
+      }
+
       const validation = this.#validateAPIResponse(data, screenName);
 
       if (!validation.isValid || !validation.accountBasedIn) {
@@ -682,7 +851,7 @@ class ActiveFetcher {
           accurate: false
         }, window.location.origin);
 
-        return null;
+        return { status: 'nodata', data: null };
       }
 
       const accountBasedIn = validation.accountBasedIn;
@@ -707,23 +876,125 @@ class ActiveFetcher {
       }, window.location.origin);
 
       return {
-        location: accountBasedIn,
-        accurate: locationAccurate
+        status: 'ok',
+        data: { location: accountBasedIn, accurate: locationAccurate }
       };
 
     } catch (error) {
-      console.error(`[xflags] Error fetching @${screenName}:`, error);
+      const timedOut = error && error.name === 'AbortError';
+      const message = timedOut
+        ? `Timed out after ${policy.POLICY.REQUEST_TIMEOUT_MS}ms`
+        : error.message;
 
-      // Log error
+      console.warn(`[xflags] Error fetching @${screenName}: ${message}`);
+
       this.#logError({
         action: 'fetchUserLocation',
-        message: error.message,
-        stack: error.stack,
-        context: { username: screenName }
+        message,
+        stack: timedOut ? undefined : error.stack,
+        context: { username: screenName, timeout: timedOut }
       });
 
-      return null;
+      // Network errors and timeouts are transient
+      return { status: 'retry', data: null };
+    } finally {
+      clearTimeout(timeoutId);
     }
+  }
+
+  // ============================================
+  // QUERY ID HANDLING
+  // ============================================
+
+  /**
+   * Load the last known-good queryId from storage
+   * @private
+   */
+  async #loadStoredQueryId() {
+    try {
+      const stored = await window.xflagBrowser.storage.get(QUERY_ID_STORAGE_KEY);
+      if (typeof stored === 'string' && QUERY_ID_PATTERN.test(stored)) {
+        this.#queryId = stored;
+      }
+    } catch (error) {
+      // Keep default
+    }
+  }
+
+  /**
+   * Set the AboutAccountQuery queryId (learned from X's traffic or JS bundles)
+   * @param {string|null} queryId - New queryId, or null if discovery found nothing
+   * @param {string} [source] - 'traffic' | 'bundle'
+   */
+  setQueryId(queryId, source = 'traffic') {
+    const valid = typeof queryId === 'string' && QUERY_ID_PATTERN.test(queryId);
+
+    if (valid && queryId !== this.#queryId) {
+      // Seen in X's own live traffic -> definitely current, forget earlier failures
+      if (source === 'traffic') {
+        this.#badQueryIds.delete(queryId);
+      }
+      if (!this.#badQueryIds.has(queryId)) {
+        console.log(`[xflags] Using AboutAccountQuery queryId ${queryId} (from ${source})`);
+        this.#queryId = queryId;
+        window.xflagBrowser.storage.set(QUERY_ID_STORAGE_KEY, queryId).catch(() => {});
+      }
+    }
+
+    if (source === 'bundle' && this.#pendingDiscovery) {
+      const resolve = this.#pendingDiscovery;
+      this.#pendingDiscovery = null;
+      resolve(valid ? queryId : null);
+    }
+  }
+
+  /**
+   * Ask the page-context interceptor to search X's loaded JS bundles for the queryId
+   * @returns {Promise<string|null>}
+   * @private
+   */
+  #discoverQueryId() {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.#pendingDiscovery === done) this.#pendingDiscovery = null;
+        resolve(null);
+      }, 6000);
+      const done = (id) => {
+        clearTimeout(timer);
+        resolve(id);
+      };
+      this.#pendingDiscovery = done;
+      window.postMessage({ type: 'XFLAG_DISCOVER_QUERY_ID' }, window.location.origin);
+    });
+  }
+
+  /**
+   * Current queryId failed with 400/404: find a replacement
+   * @returns {Promise<boolean>} True if a different queryId is now in use
+   * @private
+   */
+  async #rotateQueryId() {
+    const failed = this.#queryId;
+    this.#badQueryIds.add(failed);
+
+    const discovered = await this.#discoverQueryId();
+    if (discovered && !this.#badQueryIds.has(discovered)) {
+      this.#queryId = discovered;
+    } else {
+      const fallback = DEFAULT_QUERY_IDS.find(id => !this.#badQueryIds.has(id));
+      if (!fallback) {
+        console.error('[xflags] All known AboutAccountQuery queryIds failed; waiting for X to use the endpoint so we can learn the new one');
+        if (window.xflagConsole) {
+          window.xflagConsole.log('error', 'AboutAccountQuery queryId is stale. Open any profile\'s "About this account" to refresh it.');
+        }
+        return false;
+      }
+      this.#queryId = fallback;
+    }
+
+    console.log(`[xflags] queryId ${failed} failed, switching to ${this.#queryId}`);
+    window.xflagBrowser.storage.set(QUERY_ID_STORAGE_KEY, this.#queryId).catch(() => {});
+    return true;
   }
 
   /**
@@ -1058,10 +1329,17 @@ class ActiveFetcher {
   // ============================================
 
   /**
-   * Handle 429 rate limit error
+   * Handle 429 rate limit error (ours, or another tab's via the shared budget)
+   * @param {number} cooldownMs - How long to pause (derived from x-rate-limit-reset)
    * @private
    */
-  #handleRateLimit() {
+  #handleRateLimit(cooldownMs) {
+    const policy = window.XflagRatePolicy.POLICY;
+    if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) {
+      cooldownMs = policy.FALLBACK_COOLDOWN_MS;
+    }
+    this.#localBudget.setCooldown(Date.now() + cooldownMs);
+
     this.#rateLimited = true;
     this.#fetcherState = 'rate-limited';
 
@@ -1086,6 +1364,10 @@ class ActiveFetcher {
         screenName,
       }, window.location.origin);
       resolve(null);
+      // Release our cross-tab claim so other tabs aren't left waiting
+      if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
+        window.xflagCache.completeRequest(screenName, null, 'failed');
+      }
     });
 
     this.#requestQueue = [];
@@ -1097,7 +1379,7 @@ class ActiveFetcher {
 
     if (window.xflagConsole) {
       window.xflagConsole.log('status', `Rate limited. ${queuedItems.length} users queued for later`);
-      window.xflagConsole.log('status', 'Entering 5-minute cooldown...');
+      window.xflagConsole.log('status', `Entering cooldown (~${Math.ceil(cooldownMs / 60000)} min, until X's rate limit window resets)...`);
       if (window.xflagConsole.setFetcherState) {
         window.xflagConsole.setFetcherState('rate-limited');
       }
@@ -1106,13 +1388,10 @@ class ActiveFetcher {
     this.#rateLimitTimer = setTimeout(async () => {
       this.#rateLimitTimer = null;
       this.#rateLimited = false;
+      this.#localBudget.clearCooldown();
       this.#fetcherState = this.#deferredQueue.length > 0 ? 'active' : 'idle';
       console.log('[xflags] Cooldown complete, resuming operations');
-
-      // Notify service worker that rate limit is cleared
-      if (window.xflagCache && window.xflagCache.isUsingServiceWorker()) {
-        await window.xflagCache.setRateLimitStatus(false);
-      }
+      // (The shared cooldown in the background expires on its own at the same time)
 
       if (window.xflagConsole) {
         window.xflagConsole.log('status', 'Cooldown complete, resuming operations');
@@ -1137,7 +1416,7 @@ class ActiveFetcher {
         // Always start processing - viewport items get priority
         this.#startDeferredProcessing();
       }
-    }, this.#cooldown429);
+    }, cooldownMs);
   }
 
   /**

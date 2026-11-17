@@ -243,6 +243,19 @@
             window.xflagFetcher.setHeaders(headers);
           }
         }
+
+        if (data.type === 'XFLAG_QUERY_ID') {
+          // queryId is validated against a strict pattern inside setQueryId (null = discovery found nothing)
+          const validSource = data.source === 'traffic' || data.source === 'bundle';
+          const validId = data.queryId === null || typeof data.queryId === 'string';
+          if (!validSource || !validId) {
+            console.warn('[xflags] Invalid XFLAG_QUERY_ID message structure');
+            return;
+          }
+          if (window.xflagFetcher) {
+            window.xflagFetcher.setQueryId(data.queryId, data.source);
+          }
+        }
       } catch (error) {
         console.error('[xflags] Error processing message:', error);
       }

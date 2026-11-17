@@ -99,10 +99,15 @@ The interceptor must run in page context to access X's fetch responses, but cann
 
 ### Rate Limiting
 
-- 5-second minimum interval between API requests
-- 5-minute cooldown after receiving HTTP 429
-- Coordinated across all tabs via service worker
+- One request budget shared by all tabs (held in the background service worker)
+- Requests are paced from X's `x-rate-limit-limit` / `-remaining` / `-reset` response headers: the remaining budget (minus a 15% reserve for X's own UI) is spread evenly over the rest of the 15-minute window
+- On HTTP 429, all tabs pause until X's `x-rate-limit-reset` time (5-minute fallback if the header is missing)
+- Each request times out after 8 seconds; network errors, timeouts and 5xx are retried up to twice with backoff; 4xx are never retried
 - Viewport-priority queue ensures visible users are fetched first
+
+### Query ID
+
+X's GraphQL endpoints are addressed by a `queryId` that changes when X redeploys. xflags learns the current `AboutAccountQuery` id from X's own traffic, and on HTTP 400/404 searches X's loaded JS bundles for it before falling back to known ids.
 
 ## Project Structure
 
@@ -121,6 +126,7 @@ extension/
 │   ├── cache.js             # Service worker cache client
 │   ├── constants.js         # Message types, timing values
 │   ├── country-flags.js     # Country name → flag filename map
+│   ├── rate-limit-policy.js # Shared pacing / 429 cooldown logic (background + content)
 │   └── browser-compat.js    # Firefox/Chrome API abstraction
 ├── popup/
 │   ├── popup.html/css/js    # Settings UI
@@ -129,7 +135,6 @@ extension/
 
 ## Known Issues
 
-- Accounts may occasionally get stuck with a loading icon—scrolling usually resolves this
 - Power users will hit rate limits frequently; the local cache grows over time and reduces API calls
 
 ## Disclaimer
