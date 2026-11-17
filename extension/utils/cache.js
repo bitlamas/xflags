@@ -22,6 +22,8 @@ const SW_MESSAGE_TYPES = {
   REQUEST_COMPLETE: 'SW_REQUEST_COMPLETE',
   RATE_LIMIT_STATUS: 'SW_RATE_LIMIT_STATUS',
   RATE_LIMIT_SET: 'SW_RATE_LIMIT_SET',
+  RATE_LIMIT_ACQUIRE: 'SW_RATE_LIMIT_ACQUIRE',
+  RATE_LIMIT_REPORT: 'SW_RATE_LIMIT_REPORT',
   ERROR_LOG: 'SW_ERROR_LOG',
   ERROR_GET_ALL: 'SW_ERROR_GET_ALL',
   ERROR_CLEAR: 'SW_ERROR_CLEAR',
@@ -55,6 +57,9 @@ class CountryCache {
 
     /** @type {number|null} Debounce timer for save operations */
     this.saveTimeout = null;
+
+    /** @type {Object|null} Long-lived port to the service worker */
+    this.port = null;
   }
 
   /**
@@ -441,6 +446,9 @@ class CountryCache {
     }
 
     try {
+      // Keep a port open so the service worker can release our claims if this page goes away
+      this.ensurePort();
+
       const response = await this.sendToServiceWorker({
         type: SW_MESSAGE_TYPES.REQUEST_LOCATION,
         username
@@ -459,6 +467,7 @@ class CountryCache {
         return {
           cached: response.cached || false,
           waited: response.waited || false,
+          status: response.status || null,
           shouldFetch: response.shouldFetch || false,
           data: response.data || null
         };
@@ -480,15 +489,17 @@ class CountryCache {
    * Complete a location request (notify service worker that fetch is done)
    * @param {string} username - X username
    * @param {Object|null} data - Location data or null if failed
+   * @param {string} [status] - 'ok' | 'nodata' | 'failed'
    */
-  async completeRequest(username, data) {
+  async completeRequest(username, data, status) {
     if (!this.serviceWorkerAvailable) return;
 
     try {
       await this.sendToServiceWorker({
         type: SW_MESSAGE_TYPES.REQUEST_COMPLETE,
         username,
-        data
+        data,
+        status: status || (data ? 'ok' : 'failed')
       });
     } catch (error) {
       console.warn('[xflags] Error completing request via service worker:', error);
@@ -522,19 +533,68 @@ class CountryCache {
   }
 
   /**
-   * Set rate limit status in service worker
-   * @param {boolean} isRateLimited - Whether rate limited
+   * Enter the shared cooldown (all tabs) until an absolute timestamp
+   * @param {number} until - epoch ms
    */
-  async setRateLimitStatus(isRateLimited) {
+  async setRateLimitCooldown(until) {
     if (!this.serviceWorkerAvailable) return;
 
     try {
       await this.sendToServiceWorker({
         type: SW_MESSAGE_TYPES.RATE_LIMIT_SET,
-        isRateLimited
+        isRateLimited: true,
+        until
       });
     } catch (error) {
       // Ignore errors
+    }
+  }
+
+  /**
+   * Reserve the next request slot from the shared (all tabs) budget
+   * @returns {Promise<{waitMs: number, cooldown: boolean}|null>} null if the service worker is unavailable
+   */
+  async acquireRequestSlot() {
+    if (!this.serviceWorkerAvailable) return null;
+
+    try {
+      const response = await this.sendToServiceWorker({ type: SW_MESSAGE_TYPES.RATE_LIMIT_ACQUIRE });
+      if (response && response.success && typeof response.waitMs === 'number') {
+        return { waitMs: response.waitMs, cooldown: !!response.cooldown };
+      }
+    } catch (error) {
+      // Fall through to local pacing
+    }
+    return null;
+  }
+
+  /**
+   * Report x-rate-limit-* headers to the shared budget
+   * @param {Object} info - parsed headers
+   */
+  async reportRateLimit(info) {
+    if (!this.serviceWorkerAvailable) return;
+
+    try {
+      await this.sendToServiceWorker({ type: SW_MESSAGE_TYPES.RATE_LIMIT_REPORT, info });
+    } catch (error) {
+      // Ignore errors
+    }
+  }
+
+  /**
+   * Open (or re-open) the long-lived port the service worker uses to detect page unload
+   */
+  ensurePort() {
+    if (this.port) return;
+    try {
+      this.port = window.xflagBrowser.runtime.connect({ name: 'xflag-tab' });
+      this.port.onDisconnect.addListener(() => {
+        // Service worker was suspended/restarted; reconnect lazily on next request
+        this.port = null;
+      });
+    } catch (error) {
+      this.port = null;
     }
   }
 

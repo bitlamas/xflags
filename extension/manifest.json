@@ -17,7 +17,8 @@
   ],
 
   "background": {
-    "scripts": ["background/service-worker.js"]
+    "service_worker": "background/service-worker.js",
+    "scripts": ["utils/rate-limit-policy.js", "background/service-worker.js"]
   },
 
   "host_permissions": [
@@ -38,6 +39,7 @@
         "utils/logger.js",
         "utils/console-logger.js",
         "utils/api-data-extractor.js",
+        "utils/rate-limit-policy.js",
         "content-scripts/flag-renderer.js",
         "content-scripts/active-fetcher.js",
         "content-scripts/observer.js",
